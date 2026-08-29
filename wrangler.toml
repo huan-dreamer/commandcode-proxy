@@ -1,0 +1,21 @@
+# Worker name on Cloudflare (already deployed as commandcode-proxy)
+name = "commandcode-proxy"
+main = "src/index.js"
+compatibility_date = "2024-11-12"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+CC_API_BASE = "https://api.commandcode.ai"
+PROJECT_SLUG = "cc-proxy"
+CC_USE_PROVIDER_MODELS = "true"
+
+# 持久化每个 API Key 的 session / fingerprint。首次部署时由 Wrangler 自动创建并绑定。
+[[kv_namespaces]]
+binding = "CC_STATE"
+
+[observability.logs]
+enabled = true
+invocation_logs = true
+
+# Optional fallback API key (prefer per-request Authorization header):
+# npx wrangler secret put CC_API_KEY
