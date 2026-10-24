@@ -12,7 +12,8 @@
     "start": "wrangler dev",
     "test": "node --test test/*.test.mjs",
     "bench": "node test/bench.mjs stream",
-    "check": "node --check src/index.js"
+    "check": "node --check src/index.js",
+    "bench:big": "node test/bench-bigbody.mjs"
   },
   "engines": {
     "node": ">=18.0.0"

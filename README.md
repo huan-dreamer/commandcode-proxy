@@ -312,14 +312,33 @@ npx wrangler deploy --dry-run  # 仅校验部署配置
 
 ### 仍然出现 `exceeded CPU time limit`
 
-按顺序检查：
+**先看日志里的 `cpuTimeMs` 和 `outcome`**，这能直接区分两类问题：
 
-1. 是否在 Free 计划（10ms CPU）。长回答基本必然超限，需要升级到 Paid。
-2. 是否用了非流式（`stream: false`）跑长回答：非流式需要把整段结果缓冲在内存里，
-   代理限制了 16384 输出 token。长输出请用 `stream: true`。
-3. 上下文是否极大（几十万 token）：`JSON.parse` 请求体本身就是可观的计算量，
-   尽量压缩历史消息。
-4. 用 `npm run tail` 看日志里是否有大量 `Unknown CC event type`——已做去重，
+| 日志表现 | 含义 |
+|---|---|
+| `cpuTimeMs` 接近或略超计划上限，`wallTimeMs` 很小（几十 ms） | 请求**体**太大，死在解析阶段，跟流式无关 |
+| `wallTimeMs` 很长、`cpuTimeMs` 缓慢累积 | 流式转发过程，才和事件处理/定时器有关 |
+
+对应处理：
+
+1. **请求体过大（最常见）。** 无状态客户端每轮都会重发整个对话，工具输出累积后很容易到
+   ~1 MB。这类请求光是"解码 → `JSON.parse` → 转换成 CC 格式 → `JSON.stringify` → 发出"
+   就要数毫秒到十几毫秒，**在 Free 计划的 10 ms 预算里无法完成**（实测 CF 报
+   `cpuTimeMs: 20` / `wallTimeMs: 45`，直接 503）。用 `npm run bench:big` 复测：
+
+   ~~~text
+    body KB   msgs   median    p90
+       113     211   2.81ms   5.75ms
+      1166    2308   7.75ms   8.42ms   ← 这是 Node 的下限；同一份数据 Workers 实测 ≈20ms
+   ~~~
+
+   应对方式：
+   升级 Paid 计划，或让客户端降低单次请求体积（压缩历史、裁剪工具输出）。
+   代理本身的固定开销不到 1 ms，优化代码救不了 1 MB 的请求。
+2. **是否在 Free 计划。** Free 只有 10 ms CPU，长回答同样必然超限；Paid 默认 30 s。
+3. **是否用了非流式**（`stream: false`）：非流式要把整段结果缓冲在内存里，代理限制了
+   16384 输出 token（更大的 `max_tokens` 会直接 400）。长输出请用 `stream: true`。
+4. 用 `npm run tail` 看是否有大量 `Unknown CC event type`——已做去重，
    若仍大量出现说明上游有新事件类型，可按需在解析里显式忽略。
 
 ### Session 或指纹发生变化
