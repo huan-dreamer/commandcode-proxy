@@ -24,8 +24,12 @@ function loadConfig(env = {}) {
     apiKey: env.CC_API_KEY || '',
     logLevel: env.LOG_LEVEL || 'info',
     useProviderModels: env.CC_USE_PROVIDER_MODELS !== 'false',
-    // off | always：上游报 "JSON Schema reference expansion is too large" 时可设为 always
-    schemaSlimming: env.CC_SCHEMA_SLIM === 'always' ? 'always' : 'off',
+    // auto（默认）| always | off
+    // auto：工具 schema 总量超过预算时才裁；always：无条件裁；off：原样转发
+    schemaSlimming: ['always', 'off'].includes(env.CC_SCHEMA_SLIM) ? env.CC_SCHEMA_SLIM : 'auto',
+    // 工具 schema 的总字节预算。超过就裁剪，必要时把最大的几个工具的
+    // 参数约束清空（保留名字和描述）。
+    toolSchemaBudget: parseInt(env.CC_TOOL_SCHEMA_BUDGET || String(64 * 1024), 10),
     modelRefreshIntervalMs: parseInt(env.MODEL_REFRESH_INTERVAL_MS || String(5 * 60 * 1000), 10),
     // 空闲超时可按部署调整：上游较慢时可放宽，想更快失败时可收紧。
     streamIdleTimeoutMs: parseInt(env.CC_STREAM_IDLE_TIMEOUT_MS || String(STREAM_IDLE_TIMEOUT_MS), 10),
@@ -710,30 +714,61 @@ function slimSchema(node, depth = 0) {
   return out;
 }
 
-/** 返回裁剪后的 tools 以及体积统计；未开启时只做直通 */
-function slimTools(tools) {
+const EMPTY_SCHEMA = { type: 'object', properties: {} };
+const EMPTY_SCHEMA_BYTES = JSON.stringify(EMPTY_SCHEMA).length;
+
+/**
+ * 裁剪 tools，并把 schema 总体积压到 budgetBytes 以内。
+ *
+ * 两步：先用 slimSchema 削掉嵌套/分支/$ref；如果还超预算，就从**最大的**工具开始
+ * 把参数约束整体换成空对象（名字和描述保留，模型仍然知道工具存在）。
+ * 这样即使上游预算比预期更紧，也不会再整单被拒。
+ */
+function slimTools(tools, budgetBytes) {
+  const sizes = new Array(tools.length);
   let before = 0;
-  let after = 0;
   let changed = 0;
-  const out = tools.map((tool) => {
+
+  const out = tools.map((tool, i) => {
     const schema = tool.input_schema;
-    if (!schema || typeof schema !== 'object') return tool;
+    if (!schema || typeof schema !== 'object') {
+      sizes[i] = 0;
+      return tool;
+    }
     const beforeJson = JSON.stringify(schema);
     before += beforeJson.length;
     let slimmed = slimSchema(schema);
-    let afterJson = JSON.stringify(slimmed);
-    if (afterJson.length > SLIM_MAX_TOOL_BYTES) {
-      slimmed = { type: 'object', properties: {} };
-      afterJson = JSON.stringify(slimmed);
+    let json = JSON.stringify(slimmed);
+    if (json.length > SLIM_MAX_TOOL_BYTES) {
+      slimmed = EMPTY_SCHEMA;
+      json = JSON.stringify(EMPTY_SCHEMA);
     }
-    after += afterJson.length;
-    if (afterJson.length < beforeJson.length) {
+    sizes[i] = json.length;
+    if (json.length < beforeJson.length) {
       changed++;
       return { ...tool, input_schema: slimmed };
     }
     return tool;
   });
-  return { tools: out, changed, before, after };
+
+  // 仍超预算：按体积从大到小清空参数约束
+  let total = 0;
+  for (const s of sizes) total += s;
+  let blanked = 0;
+  if (total > budgetBytes) {
+    const order = sizes.map((_, i) => i).sort((a, b) => sizes[b] - sizes[a]);
+    for (const i of order) {
+      if (total <= budgetBytes) break;
+      if (sizes[i] <= EMPTY_SCHEMA_BYTES) continue; // 已经是最小形态
+      total -= sizes[i];
+      out[i] = { ...out[i], input_schema: EMPTY_SCHEMA };
+      sizes[i] = EMPTY_SCHEMA_BYTES;
+      total += EMPTY_SCHEMA_BYTES;
+      blanked++;
+    }
+  }
+
+  return { tools: out, changed, blanked, before, after: total };
 }
 
 let slimLogged = false;
@@ -742,6 +777,7 @@ function logSlimSummary(result) {
   slimLogged = true;
   log('info', 'Tool schemas slimmed', {
     changed: result.changed,
+    parameters_blanked: result.blanked,
     before_bytes: result.before,
     after_bytes: result.after,
     saved_pct: result.before > 0 ? Math.round((1 - result.after / result.before) * 100) : 0,
@@ -762,7 +798,7 @@ function logSchemaGuidance(body) {
   log('warn', 'Upstream rejected tool schemas (JSON Schema expansion too large)', {
     tool_count: tools.length,
     largest,
-    hint: '设置 CC_SCHEMA_SLIM=always 让代理裁剪 schema，或减少单次请求携带的工具数量',
+    hint: '工具 schema 已按 CC_TOOL_SCHEMA_BUDGET 自动裁剪但上游仍拒绝：可调小该预算或减少工具数量',
   });
 }
 
@@ -943,12 +979,26 @@ function buildCcRequest(openaiReq) {
       description: t.function?.description || t.description || '',
       input_schema: t.function?.parameters || t.input_schema || { type: 'object', properties: {} },
     }, t));
-    if (CFG.schemaSlimming === 'always') {
-      const slimmed = slimTools(mapped);
+    if (CFG.schemaSlimming === 'off') {
+      body.params.tools = mapped;
+    } else if (CFG.schemaSlimming === 'always') {
+      const slimmed = slimTools(mapped, CFG.toolSchemaBudget);
       body.params.tools = slimmed.tools;
       logSlimSummary(slimmed);
     } else {
-      body.params.tools = mapped;
+      // auto：只在总量超标时动手，正常的小工具集完全不受影响
+      let totalBytes = 0;
+      for (const t of mapped) {
+        const schema = t.input_schema;
+        if (schema && typeof schema === 'object') totalBytes += JSON.stringify(schema).length;
+      }
+      if (totalBytes > CFG.toolSchemaBudget) {
+        const slimmed = slimTools(mapped, CFG.toolSchemaBudget);
+        body.params.tools = slimmed.tools;
+        logSlimSummary(slimmed);
+      } else {
+        body.params.tools = mapped;
+      }
     }
   }
   if (tool_choice !== undefined) {

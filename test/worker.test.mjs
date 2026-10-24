@@ -813,6 +813,38 @@ function massiveSchema(depth) {
   return node;
 }
 
+/** 每层把子 schema 复制到多个 anyOf 分支里，体积随层数爆炸（真实 MCP schema 就是这样） */
+function explosiveSchema(levels) {
+  let node = { type: 'string' };
+  for (let i = 0; i < levels; i++) {
+    node = {
+      type: 'object',
+      properties: {
+        before_scenario: {
+          type: 'object',
+          properties: {
+            events: {
+              type: 'array',
+              items: {
+                items: {
+                  anyOf: [
+                    { type: 'object', properties: { redirected_from_transaction_id: { anyOf: [node, { type: 'null' }] } } },
+                    ...Array.from({ length: 7 }, (_, k) => ({
+                      type: 'object',
+                      properties: { ['f' + k]: { type: 'object', properties: { deep: node } } },
+                    })),
+                  ],
+                },
+              },
+            },
+          },
+        },
+      },
+    };
+  }
+  return node;
+}
+
 function captureBody(responder) {
   const captured = { body: null };
   globalThis.fetch = async (url, init) => {
@@ -862,7 +894,7 @@ test('CC_SCHEMA_SLIM=always shrinks oversized tool schemas before forwarding', a
   assert.deepEqual(tools[1].input_schema, { type: 'object', properties: { a: { type: 'string' } } });
 });
 
-test('without slimming the schema is forwarded verbatim', async () => {
+test('CC_SCHEMA_SLIM=off forwards the schema verbatim', async () => {
   const huge = massiveSchema(3);
   const captured = captureBody(okStream);
   try {
@@ -870,11 +902,77 @@ test('without slimming the schema is forwarded verbatim', async () => {
       model: 'm', stream: true,
       messages: [{ role: 'user', content: 'x' }],
       tools: [{ type: 'function', function: { name: 't', parameters: huge } }],
-    });
+    }, { env: { CC_SCHEMA_SLIM: 'off' } });
   } finally {
     globalThis.fetch = originalFetch;
   }
   assert.deepEqual(captured.body.params.tools[0].input_schema, huge);
+});
+
+test('auto mode (default) leaves a normal-sized tool set untouched', async () => {
+  const captured = captureBody(okStream);
+  const tools = Array.from({ length: 5 }, (_, i) => ({
+    type: 'function',
+    function: { name: `tool_${i}`, description: 'fine', parameters: { type: 'object', properties: { a: { type: 'string' } } } },
+  }));
+  try {
+    await call('/v1/chat/completions', {
+      model: 'm', stream: true, messages: [{ role: 'user', content: 'x' }], tools,
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  assert.deepEqual(captured.body.params.tools, tools.map((t) => ({
+    type: 'function', name: t.function.name, description: t.function.description, input_schema: t.function.parameters,
+  })));
+});
+
+test('auto mode slims oversized schemas without being asked', async () => {
+  const captured = captureBody(okStream);
+  const huge = explosiveSchema(3);
+  const before = JSON.stringify(huge).length;
+  assert.ok(before > 20000, 'fixture must be oversized, got ' + before);
+  try {
+    await call('/v1/chat/completions', {
+      model: 'm', stream: true,
+      messages: [{ role: 'user', content: 'x' }],
+      tools: [{ type: 'function', function: { name: 'huge', description: 'd', parameters: huge } }],
+    }, { env: { CC_TOOL_SCHEMA_BUDGET: '8192' } });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  const after = JSON.stringify(captured.body.params.tools[0].input_schema).length;
+  assert.ok(after < before / 4, `auto slimming should shrink ${before} -> ${after}`);
+  assert.equal(captured.body.params.tools[0].name, 'huge');
+});
+
+test('budget enforcement blanks the largest schemas but keeps names/descriptions', async () => {
+  const captured = captureBody(okStream);
+  // 很多工具 + 一个怪兽，整体远超预算
+  const monster = explosiveSchema(3);
+  const tools = [
+    { type: 'function', function: { name: 'monster', description: 'the monster', parameters: monster } },
+    ...Array.from({ length: 60 }, (_, i) => ({
+      type: 'function',
+      function: { name: `t${i}`, description: 'x'.repeat(300), parameters: { type: 'object', properties: { a: { type: 'string' } } } },
+    })),
+  ];
+  try {
+    await call('/v1/chat/completions', {
+      model: 'm', stream: true, messages: [{ role: 'user', content: 'x' }], tools,
+    }, { env: { CC_TOOL_SCHEMA_BUDGET: '2048' } });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  const out = captured.body.params.tools;
+  assert.equal(out.length, tools.length, '工具不能被丢弃');
+  const monsterOut = JSON.stringify(out[0].input_schema).length;
+  assert.ok(monsterOut < 64, `monster schema should be blanked, got ${monsterOut}B`);
+  assert.equal(out[0].name, 'monster');
+  assert.equal(out[0].description, 'the monster');
+  // 总体 schema 体积必须落在预算附近
+  const total = out.reduce((n, t) => n + JSON.stringify(t.input_schema || {}).length, 0);
+  assert.ok(total < 2048 + 64 * out.length, `schema bytes ${total} should respect the budget`);
 });
 
 test('$ref / $defs are removed when slimming (they are what explodes)', async () => {

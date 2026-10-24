@@ -136,7 +136,8 @@ npx wrangler deploy --dry-run
 | <code>CC_API_BASE</code> | <code>https://api.commandcode.ai</code> | Command Code 上游 API 地址 |
 | <code>PROJECT_SLUG</code> | <code>cc-proxy</code> | 项目标识；实际请求 slug 会结合 session 生成 |
 | <code>CC_USE_PROVIDER_MODELS</code> | <code>true</code> | 是否从 Provider API 获取模型列表 |
-| <code>CC_SCHEMA_SLIM</code> | <code>off</code> | 设为 <code>always</code> 时裁剪过大的工具 schema（见下文） |
+| <code>CC_SCHEMA_SLIM</code> | <code>auto</code> | <code>auto</code> 超预算才裁剪 / <code>always</code> 无条件裁剪 / <code>off</code> 原样转发 |
+| <code>CC_TOOL_SCHEMA_BUDGET</code> | <code>65536</code> | 工具 schema 总字节预算，超出即裁剪 |
 
 ### Worker Secret：<code>CC_API_KEY</code>
 
@@ -383,20 +384,26 @@ schema 是深嵌套 + 大量 <code>anyOf</code> 重复分支（MCP / browser 类
 
 两种解法：
 
-**A. 让代理裁剪 schema（推荐，一个开关）**
+**A. schema 现在会自动裁剪（默认开启）**
+
+工具 schema 总量超过 `CC_TOOL_SCHEMA_BUDGET`（默认 64KB）时，代理自动裁剪后再转发，
+无需任何配置。裁剪分两步，日志会打印一次 `Tool schemas slimmed`：
+
+1. 削结构：嵌套深度 ≤ 8、每个 `anyOf/oneOf/allOf` 最多 8 个分支、描述截断 400 字符、
+   丢弃 `$ref`/`$defs`/`examples`（递归膨胀的根源）、单工具 > 8KB 时降级为空 schema；
+2. 压预算：若仍超预算，从**最大**的工具开始把参数约束换成空对象，直到落在预算内。
+
+工具名字和描述始终保留，模型仍知道这些工具存在，只是参数约束变宽松。
 
 ~~~text
-# .dev.vars
-CC_SCHEMA_SLIM=always
+# 可选调参（.dev.vars）
+CC_TOOL_SCHEMA_BUDGET=65536   # 总预算（字节）；越小越安全，但参数约束越松
+CC_SCHEMA_SLIM=off            # 完全关闭（原样转发）
+CC_SCHEMA_SLIM=always         # 无条件裁剪（也省 CPU，因为请求体更小）
 ~~~
 
-裁剪规则：嵌套深度上限 8、每个 <code>anyOf/oneOf/allOf</code> 最多保留 8 个分支、描述截断到
-400 字符、丢弃 <code>$ref</code>/<code>$defs</code>/<code>examples</code>（递归膨胀的来源）、
-单个工具超过 8KB 时降级为 <code>{"type":"object","properties":{}}</code>。
-工具的名字和描述始终保留，所以模型仍然知道这个工具存在，只是参数约束变宽松。
-
-实测 47 个深层嵌套工具：转发的 schema 体积 0.28 MB → 0.03 MB（省 88%）。
-启动后日志会打印一次 <code>Tool schemas slimmed</code> 及节省比例。
+实测 233 个工具、其中一个 schema 65KB：转发体积 163KB → 99KB，那个大工具 65KB → 0.4KB。
+注意剩下的约 99KB 全是**工具名 + 描述**，这部分代理不会删——工具数量本身才是最大开销。
 
 **B. 减少单次请求携带的工具数量**
 
