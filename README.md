@@ -199,6 +199,70 @@ cc-state:<SHA-256(apiKey)>
 
 本地开发或移除 KV 绑定时，Worker 会自动使用内存 fallback。KV 读写异常也不会阻断正常代理请求。
 
+## 协议转换映射表
+
+代理不是透传——CommandCode 的 <code>/alpha/generate</code> 与 OpenAI/Anthropic 是两套协议，
+必须做结构转换。**但转换的目标是"信息等价"**：只换信封，不改内容。
+
+下表以官方 CLI 的实际线格式为准（<code>command-code@1.88.0</code>，
+<code>dist/cli.mjs</code> 里的 <code>toWireTools</code> / <code>toWireMessages</code> /
+<code>toWireSystem</code> / <code>buildServerConfig</code>）核对得出，不是猜的。
+
+### 请求：字段
+
+| 客户端字段 | 处理 |
+|---|---|
+| <code>model</code> | → <code>params.model</code>（缺省 <code>deepseek/deepseek-v4-flash</code>） |
+| <code>messages</code> | → <code>params.messages</code>（形状转换，见下） |
+| <code>system</code>（Anthropic） | → <code>params.system</code>，保留 <code>cache_control</code> |
+| <code>temperature</code> | → <code>params.temperature</code>，原样 |
+| <code>reasoning_effort</code> | → <code>params.reasoning_effort</code>，原样 |
+| <code>max_tokens</code> | → <code>params.max_tokens</code>，**原样不截断**；仅为非流式保留 16384 的显式上限 |
+| <code>stream</code> | 上游**恒为 <code>true</code>**（CC 只有流式）；非流式在代理侧聚合后再返回 |
+| <code>tools</code> | → <code>{name, description, input_schema}</code>，内容原样（无 <code>type</code> 包装、无 <code>type:"function"</code>） |
+| <code>tool_choice</code> / <code>parallel_tool_calls</code> | 上游契约里**没有**这两个字段；仍会带上（沿用既有行为），不要依赖其生效 |
+
+**不做转换、直接丢弃**（上游契约无对应字段，只提醒一次日志
+<code>Param has no upstream equivalent</code>）：
+<code>top_p</code>、<code>stop</code> / <code>stop_sequences</code>、
+<code>frequency_penalty</code>、<code>presence_penalty</code>、<code>seed</code>、
+<code>response_format</code>、<code>n</code>、<code>logprobs</code>、
+<code>user</code> / <code>metadata.user_id</code>。
+
+### 请求：message 内容形状
+
+| 语义 | OpenAI 入参 | 发给上游的线格式 |
+|---|---|---|
+| 文本 | <code>content: "hi"</code> | <code>{type:"text", text:"hi"}</code> |
+| 图片 | <code>{type:"image_url", image_url:{url}}</code> | <code>{type:"image", image:"data:...;base64,...", mimeType:"image/png"}</code> |
+| 推理（回传） | <code>reasoning_content: "..."</code> | <code>{type:"reasoning", text:"..."}</code> |
+| 工具调用 | <code>tool_calls[{id, function:{name, arguments}}]</code> | <code>{type:"tool-call", toolCallId, toolName, input:{...}}</code> |
+| 工具结果 | 连续多条 <code>role:"tool"</code> | **合并成一条** <code>{role:"tool", content:[{type:"tool-result", toolCallId, toolName, output:{type:"text", value}}]}</code> |
+
+其中"合并工具结果"、"图片带 <code>mimeType</code>"、"回传 <code>reasoning</code>"都是
+之前的实现漏掉的，现在与 CLI 一致。数组形式的工具结果只取 <code>text</code> 片段并用
+<code>\n</code> 连接（CLI 的 <code>toWireToolOutput</code> 就是这么做的）。
+
+### 上游需要、客户端没有的字段（合成值）
+
+<code>config</code>（<code>workingDir</code>/<code>date</code>/<code>environment</code>/
+<code>structure</code>/<code>isGitRepo</code>/<code>currentBranch</code>/…）、
+<code>memory:null</code>、<code>taste:null</code>、<code>skills:null</code>、
+<code>permissionMode</code>、<code>x-session-id</code>、<code>x-project-slug</code>
+都是代理补的：上游要求这些字段，但浏览器/Workers 里没有真实的 CLI 环境。
+指纹（fingerprint）也是按 API Key 生成并缓存的。
+
+### 响应方向
+
+| 上游 | 返回给客户端 |
+|---|---|
+| NDJSON 事件流 | OpenAI SSE <code>data: {...}</code> / Anthropic SSE <code>event: ...</code> |
+| <code>text-delta</code> | <code>content</code> / <code>text_delta</code> |
+| <code>reasoning-delta</code> | <code>reasoning_content</code> / <code>thinking</code> 块（签名是由内容派生的占位值，Anthropic 客户端只做浅校验） |
+| <code>tool-call</code> | <code>tool_calls</code> / <code>tool_use</code> 块 |
+| <code>totalUsage</code> | <code>usage</code>（<code>outputTokens=0</code> 时把 input/cached 一并归零，避免空响应被计费） |
+| <code>error</code> | 原样透出消息；schema 类确定性错误返回 <code>400</code>，其它保持 <code>429</code> 可重试 |
+
 ## API 使用
 
 ### OpenAI Chat Completions

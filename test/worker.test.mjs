@@ -923,8 +923,9 @@ test('CC_SCHEMA_SLIM=auto leaves a normal-sized tool set untouched', async () =>
   } finally {
     globalThis.fetch = originalFetch;
   }
+  // 官方 CLI 的 toWireTools 只发 {name, description, input_schema}，没有 type 包装
   assert.deepEqual(captured.body.params.tools, tools.map((t) => ({
-    type: 'function', name: t.function.name, description: t.function.description, input_schema: t.function.parameters,
+    name: t.function.name, description: t.function.description, input_schema: t.function.parameters,
   })));
 });
 
@@ -1067,4 +1068,131 @@ test('generic upstream stream error keeps the message but stays retryable', asyn
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+// ══════════════════════════════════════════════════════════════════
+// 线格式保真度：逐条对齐官方 CLI (command-code@1.88.0) 的 toWire* 形状
+// ══════════════════════════════════════════════════════════════════
+test('assistant reasoning_content is forwarded as a {type:"reasoning"} block', async () => {
+  const captured = captureBody(okStream);
+  try {
+    await call('/v1/chat/completions', {
+      model: 'm', stream: true,
+      messages: [
+        { role: 'user', content: 'q' },
+        { role: 'assistant', content: 'answer', reasoning_content: 'my earlier thinking' },
+        { role: 'user', content: 'next' },
+      ],
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  const assistant = captured.body.params.messages.find((m) => m.role === 'assistant');
+  assert.deepEqual(assistant.content, [
+    { type: 'reasoning', text: 'my earlier thinking' },
+    { type: 'text', text: 'answer' },
+  ]);
+});
+
+test('consecutive tool messages are merged into one role:tool message', async () => {
+  const captured = captureBody(okStream);
+  try {
+    await call('/v1/chat/completions', {
+      model: 'm', stream: true,
+      messages: [
+        { role: 'user', content: 'q' },
+        { role: 'assistant', content: null, tool_calls: [
+          { id: 'c1', type: 'function', function: { name: 'read', arguments: '{"p":"a"}' } },
+          { id: 'c2', type: 'function', function: { name: 'grep', arguments: '{"q":"b"}' } },
+        ] },
+        { role: 'tool', tool_call_id: 'c1', content: 'file a' },
+        { role: 'tool', tool_call_id: 'c2', content: 'match b' },
+        { role: 'user', content: 'thanks' },
+      ],
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  const msgs = captured.body.params.messages;
+  const toolMsgs = msgs.filter((m) => m.role === 'tool');
+  assert.equal(toolMsgs.length, 1, '一轮的工具结果必须合并成一条 tool 消息');
+  assert.equal(toolMsgs[0].content.length, 2);
+  assert.deepEqual(toolMsgs[0].content.map((c) => c.type), ['tool-result', 'tool-result']);
+  // 工具名从 assistant.tool_calls 反查
+  assert.equal(toolMsgs[0].content[0].toolName, 'read');
+  assert.equal(toolMsgs[0].content[1].toolName, 'grep');
+  // 顺序：tool 消息在后续 user 文本之前
+  assert.ok(msgs.indexOf(toolMsgs[0]) < msgs.findIndex((m) => m.role === 'user' && m.content[0]?.text === 'thanks'));
+});
+
+test('image blocks carry mimeType like the CLI does', async () => {
+  const captured = captureBody(okStream);
+  try {
+    await call('/v1/chat/completions', {
+      model: 'm', stream: true,
+      messages: [{ role: 'user', content: [
+        { type: 'text', text: 'look' },
+        { type: 'image_url', image_url: { url: 'data:image/png;base64,iVBORw0KGgo=' } },
+      ] }],
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  const img = captured.body.params.messages[0].content.find((c) => c.type === 'image');
+  assert.deepEqual(img, { type: 'image', image: 'data:image/png;base64,iVBORw0KGgo=', mimeType: 'image/png' });
+});
+
+test('max_tokens is forwarded as requested, not silently capped', async () => {
+  const captured = captureBody(okStream);
+  try {
+    await call('/v1/chat/completions', {
+      model: 'm', stream: true, max_tokens: 500000,
+      messages: [{ role: 'user', content: 'x' }],
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  assert.equal(captured.body.params.max_tokens, 500000);
+});
+
+test('body matches the CLI envelope: skills is null and tools have no type wrapper', async () => {
+  const captured = captureBody(okStream);
+  try {
+    await call('/v1/chat/completions', {
+      model: 'm', stream: true,
+      messages: [{ role: 'user', content: 'x' }],
+      tools: [{ type: 'function', function: { name: 't', description: 'd', parameters: { type: 'object' } } }],
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  assert.equal(captured.body.skills, null);
+  assert.equal(captured.body.taste, null);
+  assert.equal(captured.body.memory, null);
+  assert.deepEqual(Object.keys(captured.body.params.tools[0]).sort(), ['description', 'input_schema', 'name']);
+  // messages 里每条 content 都是数组（CLI 的线格式）
+  assert.ok(captured.body.params.messages.every((m) => Array.isArray(m.content)));
+});
+
+test('anthropic top_p/stop_sequences are logged as unsupported instead of silently vanishing', async () => {
+  const logs = [];
+  const realLog = console.log;
+  console.log = (l) => logs.push(String(l));
+  globalThis.fetch = async (url) => {
+    if (String(url).includes('/alpha/generate')) return okStream();
+    return new Response('{}', { status: 200 });
+  };
+  try {
+    await call('/v1/messages', {
+      model: 'claude-sonnet-4-6', max_tokens: 100, stream: true,
+      top_p: 0.9, stop_sequences: ['END'],
+      messages: [{ role: 'user', content: 'x' }],
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+    console.log = realLog;
+  }
+  const warned = logs.filter((l) => l.includes('no upstream equivalent'));
+  assert.ok(warned.length >= 1, 'should warn about unsupported params: ' + logs.join('\n'));
+  assert.ok(warned.some((l) => l.includes('top_p')));
 });

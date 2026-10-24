@@ -527,9 +527,6 @@ async function getSessionId(incomingHeaders, apiKey) {
   return ensureSession(apiKey);
 }
 
-// 每个请求独立 thread ID
-function newThreadId() { return randomUUID(); }
-
 // ── 每 Key 独立状态（fingerprint + 初始化节流） ──
 // 每个 API Key 拥有自己的设备指纹、session 和初始化定时器
 async function getOrCreateKeyState(apiKey) {
@@ -803,6 +800,17 @@ function logSchemaGuidance(body) {
   });
 }
 
+// 上游契约里没有对应字段时，只提醒一次，避免每请求刷日志
+const warnedUnsupported = new Set();
+function warnUnsupported(field) {
+  if (warnedUnsupported.has(field)) return;
+  warnedUnsupported.add(field);
+  log('warn', 'Param has no upstream equivalent, ignored', {
+    field,
+    note: '/alpha/generate 的 params 只接受 model/messages/tools/system/max_tokens/stream/temperature/reasoning_effort',
+  });
+}
+
 // ── CC 请求体构建 ─────────────────────────────────
 
 function copyCacheControl(target, source) {
@@ -872,34 +880,47 @@ function buildCcRequest(openaiReq) {
     }
   }
 
-  // 转换 messages 为 CC 格式，并保留 block/message 上的 cache_control。
-  const ccMessages = chatMessages.map(msg => {
+  // 转换 messages 为 CC 线格式。
+  // 形状以官方 CLI（command-code@1.88.0 的 toWireMessages）为准：
+  //   assistant: {type:'text'} | {type:'tool-call'} | {type:'reasoning', text}
+  //   user:      {type:'text'} | {type:'image', image, mimeType}
+  //   tool:      {type:'tool-result', toolCallId, toolName, output:{type:'text', value}}
+  // 同一轮的多个工具结果会合并进**一条** role:'tool' 消息（CLI 就是这么发的）。
+  const ccMessages = [];
+  for (const msg of chatMessages) {
     if (msg.role === 'user') {
-      if (typeof msg.content === 'string') {
-        return { role: 'user', content: [copyCacheControl({ type: 'text', text: msg.content }, msg)] };
-      }
-      // 多模态：转换 OpenAI image_url，同时保留各 block 的 cache_control。
       if (Array.isArray(msg.content)) {
         const parts = msg.content.map(part => {
           if (part.type === 'image_url') {
             const url = part.image_url?.url || '';
-            // CC CLI 真实格式: { type: "image", image: "data:image/jpeg;base64,..." }
-            return copyCacheControl({ type: 'image', image: url }, part.cache_control ? part : msg);
+            // CLI 会同时带上 mimeType，从 data URL 里取
+            const block = { type: 'image', image: url };
+            const mime = /^data:([^;,]+)[;,]/.exec(url);
+            if (mime) block.mimeType = mime[1];
+            return copyCacheControl(block, part.cache_control ? part : msg);
           }
           if (part.type === 'text') {
             return copyCacheControl({ type: 'text', text: part.text ?? part.content ?? '' }, part.cache_control ? part : msg);
           }
           return { ...part };
         }).filter(Boolean);
-        return { role: 'user', content: parts };
+        ccMessages.push({ role: 'user', content: parts });
+      } else {
+        const text = typeof msg.content === 'string' ? msg.content : String(msg.content ?? '');
+        ccMessages.push({ role: 'user', content: [copyCacheControl({ type: 'text', text }, msg)] });
       }
-      return { role: 'user', content: [copyCacheControl({ type: 'text', text: String(msg.content) }, msg)] };
+      continue;
     }
+
     if (msg.role === 'assistant') {
       const parts = [];
-      if (msg.content && typeof msg.content === 'string') {
+      // CLI 会把上一轮的 thinking 以 {type:'reasoning'} 回传给上游
+      if (typeof msg.reasoning_content === 'string' && msg.reasoning_content) {
+        parts.push(copyCacheControl({ type: 'reasoning', text: msg.reasoning_content }, msg));
+      }
+      if (typeof msg.content === 'string') {
         parts.push(copyCacheControl({ type: 'text', text: msg.content }, msg));
-      } else if (msg.content && Array.isArray(msg.content)) {
+      } else if (Array.isArray(msg.content)) {
         for (const part of msg.content) {
           if (part.type === 'text') {
             parts.push(copyCacheControl({ type: 'text', text: part.text ?? part.content ?? '' }, part.cache_control ? part : msg));
@@ -916,24 +937,39 @@ function buildCcRequest(openaiReq) {
           });
         }
       }
-      return { role: 'assistant', content: parts };
+      ccMessages.push({ role: 'assistant', content: parts });
+      continue;
     }
+
     if (msg.role === 'tool') {
-      const toolResult = {
+      // 与 CLI 的 toWireToolOutput 一致：数组内容取 text 片段并用 \n 连接
+      let value;
+      if (typeof msg.content === 'string') {
+        value = msg.content;
+      } else if (Array.isArray(msg.content)) {
+        value = msg.content
+          .filter(c => c && c.type === 'text')
+          .map(c => c.text ?? '')
+          .join('\n');
+      } else {
+        value = String(msg.content ?? '');
+      }
+      const toolResult = copyCacheControl({
         type: 'tool-result',
         toolCallId: msg.tool_call_id,
-        toolName: toolNameMap[msg.tool_call_id] || msg.name || '',
-        output: { type: 'text', value: typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content) },
-      };
-      return {
-        role: 'tool',
-        content: [copyCacheControl(toolResult, msg)],
-      };
-    }
-    return msg;
-  });
+        toolName: toolNameMap[msg.tool_call_id] || msg.name || 'unknown',
+        output: { type: 'text', value },
+      }, msg);
 
-  const threadId = newThreadId();
+      // 合并到上一条 tool 消息里（CLI 把一轮的所有工具结果放进同一条消息）
+      const last = ccMessages[ccMessages.length - 1];
+      if (last && last.role === 'tool') last.content.push(toolResult);
+      else ccMessages.push({ role: 'tool', content: [toolResult] });
+      continue;
+    }
+
+    ccMessages.push(msg);
+  }
 
   const body = {
     config: {
@@ -949,16 +985,15 @@ function buildCcRequest(openaiReq) {
     },
     memory: null,
     taste: null,
-    skills: '',
+    skills: null,   // CLI 的线格式是 null
     permissionMode: 'standard',
     params: {
       model: model || 'deepseek/deepseek-v4-flash',
       messages: ccMessages,
       // CC 上游始终以 NDJSON 流返回；非流式仅在代理侧缓冲，因此限制其输出规模。
-      max_tokens: Math.min(
-        max_tokens || (stream === true ? DEFAULT_MAX_TOKENS : MAX_NONSTREAM_OUTPUT_TOKENS),
-        stream === true ? 200000 : MAX_NONSTREAM_OUTPUT_TOKENS,
-      ),
+      // 忠实转发：客户端要多少就转多少，不再静默截断到 200000。
+      // 非流式的上限由上层显式返回 400 处理（见 MAX_NONSTREAM_OUTPUT_TOKENS）。
+      max_tokens: max_tokens || (stream === true ? DEFAULT_MAX_TOKENS : MAX_NONSTREAM_OUTPUT_TOKENS),
       stream: true,  // CC API 总是 stream
     },
   };
@@ -974,8 +1009,8 @@ function buildCcRequest(openaiReq) {
     body.params.reasoning_effort = reasoning_effort;
   }
   if (tools && tools.length > 0) {
+    // 与 CLI 的 toWireTools 一致：只有 name / description / input_schema，没有 type 包装
     const mapped = tools.map(t => copyCacheControl({
-      type: t.type || 'function',
       name: t.function?.name || t.name || '',
       description: t.function?.description || t.description || '',
       input_schema: t.function?.parameters || t.input_schema || { type: 'object', properties: {} },
@@ -1445,6 +1480,7 @@ function convertAnthropicToOpenAI(anthropicReq) {
   for (const msg of messages) {
     if (msg.role === 'assistant') {
       let textContent = '';
+      let assistantReasoning = '';
       const textBlocks = [];
       const toolCalls = [];
       const blocks = Array.isArray(msg.content) ? msg.content : [{ type: 'text', text: msg.content || '' }];
@@ -1452,6 +1488,11 @@ function convertAnthropicToOpenAI(anthropicReq) {
         if (block.type === 'text') {
           textContent += block.text || '';
           textBlocks.push(copyCacheControl({ type: 'text', text: block.text || '' }, block));
+        } else if (block.type === 'thinking' || block.type === 'redacted_thinking') {
+          // CLI 会把上一轮 thinking 以 {type:'reasoning'} 回传上游
+          if (typeof block.thinking === 'string' && block.thinking) {
+            assistantReasoning += block.thinking;
+          }
         } else if (block.type === 'tool_use') {
           toolNameFromId[block.id] = block.name;
           toolCalls.push({
@@ -1469,6 +1510,7 @@ function convertAnthropicToOpenAI(anthropicReq) {
         content: hasCacheControl(msg.content, msg.cache_control) ? textBlocks : (textContent || null),
       }, msg);
       if (toolCalls.length > 0) assistantMsg.tool_calls = toolCalls;
+      if (assistantReasoning) assistantMsg.reasoning_content = assistantReasoning;
       openaiMessages.push(assistantMsg);
     } else if (msg.role === 'user') {
       let textContent = '';
@@ -1489,6 +1531,18 @@ function convertAnthropicToOpenAI(anthropicReq) {
           }
         }
       }
+      // CLI 的顺序是：先 tool 消息，再 user 文本
+      for (const tr of toolResults) {
+        const toolContent = typeof tr.content === 'string' ? tr.content
+          : Array.isArray(tr.content) ? tr.content.filter(c => c && c.type === 'text').map(c => c.text || '').join('\n')
+          : String(tr.content || '');
+        openaiMessages.push(copyCacheControl({
+          role: 'tool',
+          tool_call_id: tr.tool_use_id,
+          name: toolNameFromId[tr.tool_use_id] || 'unknown',
+          content: toolContent,
+        }, tr));
+      }
       if (textContent || contentBlocks.length > 0) {
         const useBlocks = Array.isArray(msg.content)
           && (hasCacheControl(msg.content, msg.cache_control) || contentBlocks.some(block => block.type === 'image_url'));
@@ -1496,17 +1550,6 @@ function convertAnthropicToOpenAI(anthropicReq) {
           role: 'user',
           content: useBlocks ? contentBlocks : textContent,
         }, msg));
-      }
-      for (const tr of toolResults) {
-        const toolContent = typeof tr.content === 'string' ? tr.content
-          : Array.isArray(tr.content) ? tr.content.map(c => c.text || '').join('')
-          : String(tr.content || '');
-        openaiMessages.push(copyCacheControl({
-          role: 'tool',
-          tool_call_id: tr.tool_use_id,
-          name: toolNameFromId[tr.tool_use_id] || '',
-          content: toolContent,
-        }, tr));
       }
     }
   }
@@ -1547,9 +1590,13 @@ function convertAnthropicToOpenAI(anthropicReq) {
 
   // 6. Optional params
   if (anthropicReq.temperature !== undefined) openaiReq.temperature = anthropicReq.temperature;
-  if (anthropicReq.top_p !== undefined) openaiReq.top_p = anthropicReq.top_p;
-  if (anthropicReq.stop_sequences) openaiReq.stop = anthropicReq.stop_sequences;
-  if (anthropicReq.metadata?.user_id) openaiReq.user = anthropicReq.metadata.user_id;
+  // 注意：/alpha/generate 的 params 只接受 model / messages / tools / system /
+  // max_tokens / stream / temperature / reasoning_effort（见官方 CLI toWire* 系列）。
+  // Anthropic 的 top_p、stop_sequences、metadata.user_id 在契约里没有对应字段，
+  // 与其算出来再丢掉（曾经是死代码），不如显式记录一次，让用户知道没生效。
+  if (anthropicReq.top_p !== undefined) warnUnsupported('top_p');
+  if (anthropicReq.stop_sequences) warnUnsupported('stop_sequences');
+  if (anthropicReq.metadata?.user_id) warnUnsupported('metadata.user_id');
 
   // 7. Anthropic thinking → reasoning_effort（LiteLLM 标准映射）
   if (anthropicReq.thinking) {
