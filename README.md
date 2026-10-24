@@ -136,6 +136,7 @@ npx wrangler deploy --dry-run
 | <code>CC_API_BASE</code> | <code>https://api.commandcode.ai</code> | Command Code 上游 API 地址 |
 | <code>PROJECT_SLUG</code> | <code>cc-proxy</code> | 项目标识；实际请求 slug 会结合 session 生成 |
 | <code>CC_USE_PROVIDER_MODELS</code> | <code>true</code> | 是否从 Provider API 获取模型列表 |
+| <code>CC_SCHEMA_SLIM</code> | <code>off</code> | 设为 <code>always</code> 时裁剪过大的工具 schema（见下文） |
 
 ### Worker Secret：<code>CC_API_KEY</code>
 
@@ -369,6 +370,42 @@ node -e "fetch('https://api.commandcode.ai').catch(e=>console.log(e.cause))"
 ### 返回非流式长度限制
 
 将请求改为 <code>stream: true</code>。如果客户端必须使用非流式，将 <code>max_tokens</code> 调整到 <code>16384</code> 或更低。
+
+### 上游报 `JSON Schema reference expansion is too large`
+
+~~~text
+[warn] CC stream error {"message":"tools[46]...anyOf[3]...anyOf[1].type JSON Schema reference expansion is too large"}
+~~~
+
+上游在展开 <code>tools[].input_schema</code> 时超出预算。多见于工具数量多、且某个工具的
+schema 是深嵌套 + 大量 <code>anyOf</code> 重复分支（MCP / browser 类工具的自动生成 schema
+很容易这样）。这类 schema 同时也是请求体动辄上 MB 的主因。
+
+两种解法：
+
+**A. 让代理裁剪 schema（推荐，一个开关）**
+
+~~~text
+# .dev.vars
+CC_SCHEMA_SLIM=always
+~~~
+
+裁剪规则：嵌套深度上限 8、每个 <code>anyOf/oneOf/allOf</code> 最多保留 8 个分支、描述截断到
+400 字符、丢弃 <code>$ref</code>/<code>$defs</code>/<code>examples</code>（递归膨胀的来源）、
+单个工具超过 8KB 时降级为 <code>{"type":"object","properties":{}}</code>。
+工具的名字和描述始终保留，所以模型仍然知道这个工具存在，只是参数约束变宽松。
+
+实测 47 个深层嵌套工具：转发的 schema 体积 0.28 MB → 0.03 MB（省 88%）。
+启动后日志会打印一次 <code>Tool schemas slimmed</code> 及节省比例。
+
+**B. 减少单次请求携带的工具数量**
+
+只挂当前任务需要的工具（比如用不到 browser/REA 时先关掉），既避开上游限制，
+也直接降低请求体体积和 CPU。不设置 <code>CC_SCHEMA_SLIM</code> 时代理原样转发。
+
+> 代理原先会吞掉上游的 <code>error</code> 事件，导致客户端只看到"空响应"并反复重试。
+> 现在会把真实原因透传；schema 这类确定性错误返回 <code>400 invalid_request_error</code>，
+> 客户端不会再无意义重试。
 
 ### 仍然出现 `exceeded CPU time limit`
 

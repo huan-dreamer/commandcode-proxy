@@ -771,3 +771,201 @@ test('anthropic stream: client cancel releases the generator and its watchdog', 
 
   await assertNoLiveTimers();
 });
+
+// ══════════════════════════════════════════════════════════════════
+// Tool schema slimming / upstream schema rejection
+// ══════════════════════════════════════════════════════════════════
+
+/** 深嵌套 + 大量 anyOf 重复分支，模拟 MCP 工具那种会撑爆上游的 schema */
+function massiveSchema(depth) {
+  let node = { type: 'string' };
+  for (let i = 0; i < depth; i++) {
+    node = {
+      type: 'object',
+      properties: {
+        before_scenario: {
+          type: 'object',
+          properties: {
+            events: {
+              type: 'array',
+              items: {
+                items: {
+                  anyOf: [
+                    { type: 'object', properties: { redirected_from_transaction_id: { anyOf: [node, { type: 'null' }] } } },
+                    { type: 'object', properties: { seq: { type: 'number' } } },
+                    { type: 'object', properties: { kind: { type: 'string' } } },
+                    { type: 'object', properties: { at: { type: 'number' } } },
+                    { type: 'object', properties: { x: { type: 'string' } } },
+                    { type: 'object', properties: { y: { type: 'string' } } },
+                    { type: 'object', properties: { z: { type: 'string' } } },
+                    { type: 'object', properties: { w: { type: 'string' } } },
+                    { type: 'object', properties: { v: { type: 'string' } } },
+                    { type: 'object', properties: { u: { type: 'string' } } },
+                  ],
+                },
+              },
+            },
+          },
+        },
+      },
+    };
+  }
+  return node;
+}
+
+function captureBody(responder) {
+  const captured = { body: null };
+  globalThis.fetch = async (url, init) => {
+    const u = String(url);
+    if (u.includes('/alpha/generate')) {
+      captured.body = JSON.parse(init.body);
+      return responder();
+    }
+    return new Response('{}', { status: 200 });
+  };
+  return captured;
+}
+
+const okStream = () => new Response(byteStream(ndjson([
+  { type: 'text-delta', text: 'ok' },
+  { type: 'finish', finishReason: 'stop', totalUsage: { inputTokens: 1, outputTokens: 1 } },
+])), { status: 200 });
+
+test('CC_SCHEMA_SLIM=always shrinks oversized tool schemas before forwarding', async () => {
+  const huge = massiveSchema(8);
+  const beforeBytes = JSON.stringify(huge).length;
+  assert.ok(beforeBytes > 5000, 'fixture should be big, got ' + beforeBytes);
+
+  const captured = captureBody(okStream);
+  try {
+    const { res } = await call('/v1/chat/completions', {
+      model: 'm', stream: true,
+      messages: [{ role: 'user', content: 'x' }],
+      tools: [
+        { type: 'function', function: { name: 'huge_tool', description: 'big one', parameters: huge } },
+        { type: 'function', function: { name: 'small_tool', description: 'tiny', parameters: { type: 'object', properties: { a: { type: 'string' } } } } },
+      ],
+    }, { env: { CC_SCHEMA_SLIM: 'always' } });
+    assert.equal(res.status, 200);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  const tools = captured.body.params.tools;
+  assert.equal(tools.length, 2, 'must not drop tools');
+  const hugeAfter = JSON.stringify(tools[0].input_schema).length;
+  assert.ok(hugeAfter < beforeBytes / 2, `expected big reduction, ${beforeBytes} -> ${hugeAfter}`);
+  // 名字和描述必须保留，否则模型不知道这个工具存在
+  assert.equal(tools[0].name, 'huge_tool');
+  assert.equal(tools[0].description, 'big one');
+  // 小 schema 不该被无故改动
+  assert.deepEqual(tools[1].input_schema, { type: 'object', properties: { a: { type: 'string' } } });
+});
+
+test('without slimming the schema is forwarded verbatim', async () => {
+  const huge = massiveSchema(3);
+  const captured = captureBody(okStream);
+  try {
+    await call('/v1/chat/completions', {
+      model: 'm', stream: true,
+      messages: [{ role: 'user', content: 'x' }],
+      tools: [{ type: 'function', function: { name: 't', parameters: huge } }],
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  assert.deepEqual(captured.body.params.tools[0].input_schema, huge);
+});
+
+test('$ref / $defs are removed when slimming (they are what explodes)', async () => {
+  const withRefs = {
+    type: 'object',
+    properties: {
+      a: { $ref: '#/$defs/Node' },
+      b: { anyOf: [{ $ref: '#/$defs/Node' }, { type: 'null' }] },
+    },
+    $defs: { Node: { type: 'object', properties: { child: { $ref: '#/$defs/Node' } } } },
+  };
+  const captured = captureBody(okStream);
+  try {
+    await call('/v1/chat/completions', {
+      model: 'm', stream: true,
+      messages: [{ role: 'user', content: 'x' }],
+      tools: [{ type: 'function', function: { name: 't', parameters: withRefs } }],
+    }, { env: { CC_SCHEMA_SLIM: 'always' } });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  const schema = captured.body.params.tools[0].input_schema;
+  assert.equal(schema.$defs, undefined, '$defs must be dropped');
+  assert.equal(JSON.stringify(schema).includes('$ref'), false, 'no dangling $ref may remain');
+});
+
+test('upstream schema rejection surfaces the real reason instead of "empty response"', async () => {
+  const reason = 'tools[0].function.parameters.properties.x.anyOf[1].type JSON Schema reference expansion is too large';
+  globalThis.fetch = async (url) => {
+    if (String(url).includes('/alpha/generate')) {
+      return new Response(byteStream(ndjson([
+        { type: 'start' },
+        { type: 'error', error: { message: reason } },
+      ])), { status: 200 });
+    }
+    return new Response('{}', { status: 200 });
+  };
+  try {
+    const { res, text } = await call('/v1/chat/completions', {
+      model: 'm', stream: true,
+      messages: [{ role: 'user', content: 'x' }],
+      tools: [{ type: 'function', function: { name: 't', parameters: { type: 'object' } } }],
+    });
+    // 确定性失败 → 400，客户端不该继续重试
+    assert.equal(res.status, 400);
+    const body = JSON.parse(text);
+    assert.equal(body.error.type, 'invalid_request_error');
+    assert.match(body.error.message, /JSON Schema reference expansion is too large/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('non-stream: upstream schema rejection also returns the real reason', async () => {
+  const reason = 'tools[1].function.parameters JSON Schema reference expansion is too large';
+  globalThis.fetch = async (url) => {
+    if (String(url).includes('/alpha/generate')) {
+      return new Response(byteStream(ndjson([
+        { type: 'error', error: { message: reason } },
+      ])), { status: 200 });
+    }
+    return new Response('{}', { status: 200 });
+  };
+  try {
+    const { res, text } = await call('/v1/chat/completions', {
+      model: 'm', stream: false, max_tokens: 100,
+      messages: [{ role: 'user', content: 'x' }],
+    });
+    assert.equal(res.status, 400);
+    assert.match(JSON.parse(text).error.message, /expansion is too large/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('generic upstream stream error keeps the message but stays retryable', async () => {
+  globalThis.fetch = async (url) => {
+    if (String(url).includes('/alpha/generate')) {
+      return new Response(byteStream(ndjson([
+        { type: 'error', error: { message: 'upstream model overloaded' } },
+      ])), { status: 200 });
+    }
+    return new Response('{}', { status: 200 });
+  };
+  try {
+    const { res, text } = await call('/v1/chat/completions', {
+      model: 'm', stream: true, messages: [{ role: 'user', content: 'x' }],
+    });
+    assert.equal(res.status, 429);
+    assert.match(JSON.parse(text).error.message, /overloaded/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});

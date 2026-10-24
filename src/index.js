@@ -24,6 +24,8 @@ function loadConfig(env = {}) {
     apiKey: env.CC_API_KEY || '',
     logLevel: env.LOG_LEVEL || 'info',
     useProviderModels: env.CC_USE_PROVIDER_MODELS !== 'false',
+    // off | always：上游报 "JSON Schema reference expansion is too large" 时可设为 always
+    schemaSlimming: env.CC_SCHEMA_SLIM === 'always' ? 'always' : 'off',
     modelRefreshIntervalMs: parseInt(env.MODEL_REFRESH_INTERVAL_MS || String(5 * 60 * 1000), 10),
     // 空闲超时可按部署调整：上游较慢时可放宽，想更快失败时可收紧。
     streamIdleTimeoutMs: parseInt(env.CC_STREAM_IDLE_TIMEOUT_MS || String(STREAM_IDLE_TIMEOUT_MS), 10),
@@ -665,6 +667,105 @@ function getEnvironment() {
   return 'win32-x64, Node.js 22.0.0';
 }
 
+// ── 工具 schema 瘦身 ────────────────────────────────
+// 上游会展开 tools[].input_schema 里的 JSON Schema。客户端（尤其 MCP 工具）常生成
+// 深嵌套 + 大量 anyOf 重复分支的 schema，展开后体积爆炸，上游直接拒绝：
+//   tools[46]...anyOf[3]...anyOf[1].type JSON Schema reference expansion is too large
+// 这里提供可选的裁剪：限制嵌套深度 / anyOf 分支数 / 描述长度，丢掉 $ref 与 $defs
+// （无法安全内联，且正是递归膨胀的来源）。
+const SLIM_MAX_DEPTH = 8;
+const SLIM_MAX_BRANCHES = 8;
+const SLIM_MAX_DESCRIPTION = 400;
+const SLIM_MAX_TOOL_BYTES = 8 * 1024;
+const SLIM_DROP_KEYS = new Set(['$defs', 'definitions', '$schema', '$comment', 'examples', 'title', '$id']);
+
+function slimSchema(node, depth = 0) {
+  if (node === null || typeof node !== 'object') return node;
+  if (depth >= SLIM_MAX_DEPTH) {
+    // 超出深度只保留类型，避免下游继续展开
+    return typeof node.type === 'string' ? { type: node.type } : {};
+  }
+  if (Array.isArray(node)) {
+    return node.slice(0, SLIM_MAX_BRANCHES).map((n) => slimSchema(n, depth + 1));
+  }
+  // $ref 可能递归：替换成"任意值"，打断膨胀链
+  if (typeof node.$ref === 'string') return {};
+
+  const out = {};
+  for (const key in node) {
+    if (SLIM_DROP_KEYS.has(key)) continue;
+    const value = node[key];
+    if (key === 'description' && typeof value === 'string') {
+      out[key] = value.length > SLIM_MAX_DESCRIPTION
+        ? value.slice(0, SLIM_MAX_DESCRIPTION) + '…'
+        : value;
+      continue;
+    }
+    if ((key === 'anyOf' || key === 'oneOf' || key === 'allOf') && Array.isArray(value)) {
+      out[key] = value.slice(0, SLIM_MAX_BRANCHES).map((n) => slimSchema(n, depth + 1));
+      continue;
+    }
+    out[key] = slimSchema(value, depth + 1);
+  }
+  return out;
+}
+
+/** 返回裁剪后的 tools 以及体积统计；未开启时只做直通 */
+function slimTools(tools) {
+  let before = 0;
+  let after = 0;
+  let changed = 0;
+  const out = tools.map((tool) => {
+    const schema = tool.input_schema;
+    if (!schema || typeof schema !== 'object') return tool;
+    const beforeJson = JSON.stringify(schema);
+    before += beforeJson.length;
+    let slimmed = slimSchema(schema);
+    let afterJson = JSON.stringify(slimmed);
+    if (afterJson.length > SLIM_MAX_TOOL_BYTES) {
+      slimmed = { type: 'object', properties: {} };
+      afterJson = JSON.stringify(slimmed);
+    }
+    after += afterJson.length;
+    if (afterJson.length < beforeJson.length) {
+      changed++;
+      return { ...tool, input_schema: slimmed };
+    }
+    return tool;
+  });
+  return { tools: out, changed, before, after };
+}
+
+let slimLogged = false;
+function logSlimSummary(result) {
+  if (slimLogged) return;
+  slimLogged = true;
+  log('info', 'Tool schemas slimmed', {
+    changed: result.changed,
+    before_bytes: result.before,
+    after_bytes: result.after,
+    saved_pct: result.before > 0 ? Math.round((1 - result.after / result.before) * 100) : 0,
+  });
+}
+
+// 上游因为 schema 过大拒绝时，把"哪个工具最大"直接指出来，省得用户自己猜
+let schemaGuidanceLogged = false;
+function logSchemaGuidance(body) {
+  const tools = body?.params?.tools;
+  if (!tools || tools.length === 0) return;
+  if (schemaGuidanceLogged) return;
+  schemaGuidanceLogged = true;
+  const largest = tools
+    .map((t) => ({ name: t.name || '?', bytes: JSON.stringify(t.input_schema || {}).length }))
+    .sort((a, b) => b.bytes - a.bytes)
+    .slice(0, 3);
+  log('warn', 'Upstream rejected tool schemas (JSON Schema expansion too large)', {
+    tool_count: tools.length,
+    largest,
+    hint: '设置 CC_SCHEMA_SLIM=always 让代理裁剪 schema，或减少单次请求携带的工具数量',
+  });
+}
+
 // ── CC 请求体构建 ─────────────────────────────────
 
 function copyCacheControl(target, source) {
@@ -836,12 +937,19 @@ function buildCcRequest(openaiReq) {
     body.params.reasoning_effort = reasoning_effort;
   }
   if (tools && tools.length > 0) {
-    body.params.tools = tools.map(t => copyCacheControl({
+    const mapped = tools.map(t => copyCacheControl({
       type: t.type || 'function',
       name: t.function?.name || t.name || '',
       description: t.function?.description || t.description || '',
       input_schema: t.function?.parameters || t.input_schema || { type: 'object', properties: {} },
     }, t));
+    if (CFG.schemaSlimming === 'always') {
+      const slimmed = slimTools(mapped);
+      body.params.tools = slimmed.tools;
+      logSlimSummary(slimmed);
+    } else {
+      body.params.tools = mapped;
+    }
   }
   if (tool_choice !== undefined) {
     // OpenAI 格式 → CC (Anthropic 风格) 格式
@@ -888,6 +996,8 @@ function createSseTranslator(model, completionId, created) {
 
   const translator = {
     lastCcEvent: '',
+    lastErrorMessage: '',
+    schemaError: false,
     inputTokens: 0,
     outputTokens: 0,
     cachedInputTokens: 0,
@@ -981,8 +1091,12 @@ function createSseTranslator(model, completionId, created) {
         }
 
         case 'error': {
-          log('warn', 'CC stream error', { message: event.error?.message || event.message || 'Unknown error' });
-          // 不发 finish_reason chunk，交给流自然结束处理。
+          const message = event.error?.message || event.message || 'Unknown error';
+          this.lastErrorMessage = message;
+          if (message.includes('JSON Schema')) this.schemaError = true;
+          log('warn', 'CC stream error', { message });
+          // 不发 finish_reason chunk，交给流自然结束处理；
+          // 但如果这轮什么都没有产出，收尾时要把这条真实原因告诉客户端。
           return '';
         }
 
@@ -1037,6 +1151,8 @@ async function collectCcStream(response, idleTimeoutMs) {
     bytes: 0,
     lastEvent: '',
     sawError: false,
+    errorMessage: '',
+    schemaError: false,
   };
 
   const handleLine = (line) => {
@@ -1069,10 +1185,14 @@ async function collectCcStream(response, idleTimeoutMs) {
         out.finishReason = mapFinishReason(event.finishReason || 'stop');
         if (event.totalUsage) out.usage = event.totalUsage;
         break;
-      case 'error':
+      case 'error': {
         out.sawError = true;
-        log('warn', 'CC stream error (non-stream)', { message: event.error?.message || event.message });
+        const message = event.error?.message || event.message || 'Unknown error';
+        out.errorMessage = message;
+        if (message.includes('JSON Schema')) out.schemaError = true;
+        log('warn', 'CC stream error (non-stream)', { message });
         break;
+      }
       default:
         if (!CC_SILENT_EVENTS.has(type)) logUnknownEvent(type);
         break;
@@ -1808,6 +1928,15 @@ async function handleChatCompletions(request, ctx) {
       if (!gotVisible && translator.outputTokens === 0 && preEvents.length === 0) {
         watcher.stop();
         try { abortController.abort(); } catch {}
+        if (translator.lastErrorMessage) {
+          // 上游明确拒绝了这次请求：把原因如实返回，而不是伪装成"空响应 + 请重试"。
+          // schema 过大是确定性的，用 400 让客户端停止无意义的重试。
+          if (translator.schemaError) {
+            logSchemaGuidance(ccBody);
+            return jsonResponse(400, { error: { message: translator.lastErrorMessage, type: 'invalid_request_error' } });
+          }
+          return jsonResponse(429, { error: { message: translator.lastErrorMessage, type: 'rate_limit_error' }, retry_after: 10 });
+        }
         return jsonResponse(429, { error: { message: 'Empty response from upstream (zero output tokens)', type: 'rate_limit_error' }, retry_after: 10 });
       }
 
@@ -1862,6 +1991,7 @@ async function handleChatCompletions(request, ctx) {
                 if (translator.outputTokens === 0) {
                   // 输出为 0 记为错误，避免下游按空响应计费
                   try { abortController.abort(); } catch {}
+                  if (translator.schemaError) logSchemaGuidance(ccBody);
                   logUsage({
                     path: '/v1/chat/completions',
                     model,
@@ -1876,7 +2006,13 @@ async function handleChatCompletions(request, ctx) {
                     bytesReceived,
                     status: 'empty_output',
                   });
-                  queue.push(`data: ${JSON.stringify({ error: { message: 'Empty response from upstream (zero output tokens)', type: 'rate_limit_error' }, retry_after: 10 })}\n\n`);
+                  queue.push(`data: ${JSON.stringify({
+                    error: {
+                      message: translator.lastErrorMessage || 'Empty response from upstream (zero output tokens)',
+                      type: translator.lastErrorMessage ? 'upstream_error' : 'rate_limit_error',
+                    },
+                    retry_after: 10,
+                  })}\n\n`);
                 } else {
                   consecutiveTimeouts = 0;
                   logUsage({
@@ -1977,7 +2113,17 @@ async function handleChatCompletions(request, ctx) {
 
     if ((usage?.outputTokens ?? 0) === 0) {
       try { if (!abortController.signal.aborted) abortController.abort(); } catch {}
-      return jsonResponse(429, { error: { message: 'Empty response from upstream (zero output tokens)', type: 'rate_limit_error' }, retry_after: 10 });
+      if (collected.schemaError) {
+        logSchemaGuidance(ccBody);
+        return jsonResponse(400, { error: { message: collected.errorMessage || 'Upstream rejected the request', type: 'invalid_request_error' } });
+      }
+      return jsonResponse(429, {
+        error: {
+          message: collected.errorMessage || 'Empty response from upstream (zero output tokens)',
+          type: collected.errorMessage ? 'upstream_error' : 'rate_limit_error',
+        },
+        retry_after: 10,
+      });
     }
 
     consecutiveTimeouts = 0;

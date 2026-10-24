@@ -9,6 +9,9 @@ CC_API_BASE = "https://api.commandcode.ai"
 PROJECT_SLUG = "cc-proxy"
 CC_USE_PROVIDER_MODELS = "true"
 
+# 工具 schema 过大时（上游报 JSON Schema reference expansion is too large）设为 "always"
+# CC_SCHEMA_SLIM = "always"
+
 # 空闲超时（毫秒）。上游慢/抖动大时可放宽；想更快失败并让客户端重试时可收紧。
 # 说明见 README「性能与 CPU 限制」。
 # CC_STREAM_IDLE_TIMEOUT_MS = "30000"
