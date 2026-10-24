@@ -288,6 +288,33 @@ function logUnknownEvent(type) {
   log('warn', 'Unknown CC event type', { type });
 }
 
+// undici/Workers 的 fetch 失败只给一句 "fetch failed"，真正的原因藏在 cause 里。
+// 不把它挖出来，用户只能看到无信息量的报错（比如把 TLS 证书问题误判成网络不通）。
+const TLS_FAILURE_CODES = new Set([
+  'UNABLE_TO_GET_ISSUER_CERT_LOCALLY',
+  'UNABLE_TO_VERIFY_LEAF_SIGNATURE',
+  'SELF_SIGNED_CERT_IN_CHAIN',
+  'DEPTH_ZERO_SELF_SIGNED_CERT',
+  'CERT_HAS_EXPIRED',
+  'ERR_TLS_CERT_ALTNAME_INVALID',
+]);
+
+function describeFetchError(e) {
+  if (!e) return 'unknown error';
+  const cause = e.cause;
+  const code = (cause && (cause.code || cause.name)) || '';
+  if (cause && TLS_FAILURE_CODES.has(code)) {
+    return `${e.message} (${code}: 上游 TLS 证书校验失败，通常是本机根证书库缺少该链的锚点`
+      + '，而不是网络不通。本地运行可用 `npm run serve`（会自动合并系统根证书），'
+      + '或设置 NODE_EXTRA_CA_CERTS=<系统根证书路径>）';
+  }
+  if (cause) {
+    const detail = [code, cause.message].filter(Boolean).join(' ');
+    return detail ? `${e.message}: ${detail}` : e.message;
+  }
+  return e.message;
+}
+
 /** 解析一行上游 NDJSON；非常规行（空行、[DONE]、SSE 注释）返回 null */
 function parseCcLine(line) {
   const first = line.charCodeAt(0);
@@ -1774,7 +1801,7 @@ async function handleChatCompletions(request, ctx) {
             : 'Response timeout - request timed out';
           return jsonResponse(429, { error: { message: timeoutMsg, type: 'rate_limit_error', input_tokens: 0 }, retry_after: 5 });
         }
-        return jsonResponse(502, { error: { message: `Upstream error: ${streamError.message}`, type: 'proxy_error', input_tokens: 0 }, retry_after: 10 });
+        return jsonResponse(502, { error: { message: `Upstream error: ${describeFetchError(streamError)}`, type: 'proxy_error', input_tokens: 0 }, retry_after: 10 });
       }
 
       // 在预缓冲阶段就结束且没有任何可见输出
@@ -1914,7 +1941,7 @@ async function handleChatCompletions(request, ctx) {
               try { controller.close(); } catch {}
               return;
             } else {
-              log('error', 'Stream error', { message: e && e.message });
+              log('error', 'Stream error', { message: describeFetchError(e) });
               try { abortController.abort(); } catch {}
               queue.push(`data: ${JSON.stringify({ error: { message: (e && e.message) || 'upstream error', type: 'proxy_error' } })}\n\n`);
             }
@@ -2008,9 +2035,9 @@ async function handleChatCompletions(request, ctx) {
         : 'Response timeout - request timed out';
       return jsonResponse(429, { error: { message: timeoutMsg, type: 'rate_limit_error', input_tokens: 0 }, retry_after: 5 });
     }
-    log('error', 'Upstream error', { message: e.message });
+    log('error', 'Upstream error', { message: describeFetchError(e) });
     try { abortController.abort(); } catch {}
-    return jsonResponse(502, { error: { message: `Upstream error: ${e.message}`, type: 'proxy_error', input_tokens: 0 }, retry_after: 10 });
+    return jsonResponse(502, { error: { message: `Upstream error: ${describeFetchError(e)}`, type: 'proxy_error', input_tokens: 0 }, retry_after: 10 });
   }
 }
 
@@ -2098,7 +2125,7 @@ async function handleMessages(request, ctx) {
             : 'Response timeout - request timed out';
           return anthropicErrorResponse(429, 'rate_limit_error', timeoutMsg, 5);
         }
-        return anthropicErrorResponse(502, 'proxy_error', `Upstream error: ${genError.message}`, 10);
+        return anthropicErrorResponse(502, 'proxy_error', `Upstream error: ${describeFetchError(genError)}`, 10);
       }
 
       if (!gotVisible && ctx.outputTokens === 0) {
@@ -2180,7 +2207,7 @@ async function handleMessages(request, ctx) {
                 : 'Response timeout - request timed out';
               msg = `event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: timeoutMsg }, retry_after: 5 })}\n\n`;
             } else {
-              log('error', 'Anthropic stream error', { message: e && e.message });
+              log('error', 'Anthropic stream error', { message: describeFetchError(e) });
               try { abortController.abort(); } catch {}
               msg = `event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'internal_error', message: (e && e.message) || 'upstream error' } })}\n\n`;
             }
@@ -2247,9 +2274,9 @@ async function handleMessages(request, ctx) {
         : 'Response timeout - request timed out';
       return anthropicErrorResponse(429, 'rate_limit_error', timeoutMsg, 5);
     }
-    log('error', 'Upstream error', { message: e.message });
+    log('error', 'Upstream error', { message: describeFetchError(e) });
     try { abortController.abort(); } catch {}
-    return anthropicErrorResponse(502, 'proxy_error', `Upstream error: ${e.message}`, 10);
+    return anthropicErrorResponse(502, 'proxy_error', `Upstream error: ${describeFetchError(e)}`, 10);
   }
 }
 

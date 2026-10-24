@@ -338,6 +338,30 @@ npx wrangler deploy --dry-run  # 仅校验部署配置
 
 确认 Secret 名称严格为 <code>CF_API_TOKEN</code>，并且配置在当前仓库的 Actions Secrets 中，而不是 Variables。
 
+### 本地运行时所有请求都 `fetch failed`
+
+日志里 `registry.npmjs.org`、`fingerprint`、`/alpha/generate` 全部报 `fetch failed`，
+但 `curl` 和浏览器都正常——**这通常不是网络问题，而是 Node 的根证书库缺锚点**。
+
+Node 自带的是 Mozilla 根证书包，可能不包含某些证书链的锚点（实测 Node v22.22.0 的
+146 个根里没有 `GTS Root R4` / `GlobalSign Root CA`），于是 TLS 校验失败。
+`fetch` 只会抛一句 `fetch failed`，真正原因藏在 `cause` 里：
+
+~~~bash
+node -e "fetch('https://api.commandcode.ai').catch(e=>console.log(e.cause))"
+# 常见输出：
+#   cause: UNABLE_TO_GET_ISSUER_CERT_LOCALLY: unable to get local issuer certificate
+~~~
+
+`npm run serve` 已经处理了这件事：启动时把系统根证书并入默认列表，
+日志会打印 `[certs] 已合并系统根证书：default 146 + system 4 → 150`。
+
+- 关掉这个行为：`CC_SYSTEM_CA=0 npm run serve`
+- 自己指定根证书：`NODE_EXTRA_CA_CERTS=/etc/ssl/cert.pem npm run serve`
+- 如果你的 Node 太旧（不支持 `tls.setDefaultCACertificates`），同样用 `NODE_EXTRA_CA_CERTS`。
+
+现在这类失败会直接在错误信息里写明是 TLS 证书问题，而不是笼统的 `fetch failed`。
+
 ### 返回 401
 
 检查请求是否包含 <code>Authorization: Bearer user_...</code> 或 <code>x-api-key: user_...</code>。如果依赖 Worker 兜底 Key，检查是否已执行 <code>npx wrangler secret put CC_API_KEY</code>。

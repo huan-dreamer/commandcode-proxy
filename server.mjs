@@ -16,12 +16,45 @@
  */
 
 import http from 'node:http';
+import tls from 'node:tls';
 import { existsSync, readFileSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import worker from './src/index.js';
 
 const MAX_BODY_SIZE = 10 * 1024 * 1024; // 与 src/index.js 保持一致
 const DEFAULT_PORT = 8787;
+
+/**
+ * 把系统根证书并入 Node 的默认 CA 列表。
+ *
+ * 为什么需要：Node 自带的根证书包可能缺少某些证书链的锚点
+ * （实测 Node v22.22.0 的 146 个根里没有 GTS Root R4 / GlobalSign Root CA），
+ * 于是所有 HTTPS 请求都报 `UNABLE_TO_GET_ISSUER_CERT_LOCALLY`，
+ * 而 curl / 浏览器却正常——很容易被误判成"网络被墙"或代理问题。
+ *
+ * 关掉：CC_SYSTEM_CA=0；或自行设置 NODE_EXTRA_CA_CERTS。
+ */
+export function trustSystemCAs({ quiet = false } = {}) {
+  if (process.env.CC_SYSTEM_CA === '0') return null;
+  if (process.env.NODE_EXTRA_CA_CERTS) return null; // 用户已自行指定，尊重它
+  if (typeof tls.getCACertificates !== 'function' || typeof tls.setDefaultCACertificates !== 'function') {
+    return null; // 旧版本 Node 不支持
+  }
+  try {
+    const base = tls.getCACertificates('default') || [];
+    const system = tls.getCACertificates('system') || [];
+    if (system.length === 0) return null;
+    const merged = [...new Set([...base, ...system])];
+    if (merged.length === base.length) return null; // 没有新增，无需动作
+    tls.setDefaultCACertificates(merged);
+    if (!quiet) {
+      console.log(`[certs] 已合并系统根证书：default ${base.length} + system ${system.length} → ${merged.length}`);
+    }
+    return { base: base.length, system: system.length, merged: merged.length };
+  } catch {
+    return null; // 平台不支持就静默跳过，别影响启动
+  }
+}
 
 /** 读取 wrangler 风格的 .dev.vars（KEY=VALUE，支持 # 注释和引号） */
 function loadDotVars(file) {
@@ -153,6 +186,8 @@ async function main() {
   };
   // wrangler 里的字符串变量可能为空串，避免空串覆盖默认值
   for (const k of Object.keys(env)) if (env[k] === '') delete env[k];
+
+  trustSystemCAs();
 
   const port = Number(env.PORT || DEFAULT_PORT);
   const server = createProxyServer(env);
