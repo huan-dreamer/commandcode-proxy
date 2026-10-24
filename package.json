@@ -10,10 +10,11 @@
     "deploy": "wrangler deploy",
     "tail": "wrangler tail",
     "start": "wrangler dev",
+    "serve": "node server.mjs",
     "test": "node --test test/*.test.mjs",
     "bench": "node test/bench.mjs stream",
-    "check": "node --check src/index.js",
-    "bench:big": "node test/bench-bigbody.mjs"
+    "bench:big": "node test/bench-bigbody.mjs",
+    "check": "node --check src/index.js"
   },
   "engines": {
     "node": ">=18.0.0"

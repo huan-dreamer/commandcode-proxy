@@ -120,6 +120,7 @@ async function refreshCCVersion() {
     const pkg = await res.json();
     if (pkg.version && typeof pkg.version === 'string') {
       CC_VERSION = pkg.version;
+      ccVersionResolved = true;
       log('info', 'CC Version refreshed from npm', { version: CC_VERSION });
     }
   } catch (e) {
@@ -128,9 +129,15 @@ async function refreshCCVersion() {
 }
 // Workers: no setInterval — lazy refresh on demand (see maybeRefreshCCVersion)
 let ccVersionLastFetch = 0;
+let ccVersionResolved = false;
+// 首次失败后的重试间隔。原先用「版本号仍是兜底值」判断，会在 registry 不可达时
+// 变成每个请求都重试一次（白白多一个子请求），这里改成显式的短退避。
+const CC_VERSION_RETRY_MS = 10 * 60 * 1000;
+
 async function maybeRefreshCCVersion() {
   const now = Date.now();
-  if (now - ccVersionLastFetch < CC_VERSION_REFRESH_MS && CC_VERSION !== CC_VERSION_FALLBACK) return;
+  const window = ccVersionResolved ? CC_VERSION_REFRESH_MS : CC_VERSION_RETRY_MS;
+  if (now - ccVersionLastFetch < window) return;
   ccVersionLastFetch = now;
   await refreshCCVersion();
 }
@@ -204,6 +211,21 @@ function createIdleWatcher(timeoutMs, onIdle) {
     },
     get timedOut() { return fired; },
   };
+}
+
+/**
+ * 静默关闭 reader。
+ * 注意：cancel() 返回 Promise，`try { reader.cancel() } catch {}` 抓不到它的 rejection。
+ * abort 之后它会以 AbortError 拒绝，变成 unhandledRejection（Workers 也会把它记成错误日志）。
+ */
+function cancelReader(reader) {
+  if (!reader) return;
+  try {
+    const p = reader.cancel();
+    if (p && typeof p.catch === 'function') p.catch(() => {});
+  } catch {
+    // 同步抛错（流已关闭等）同样忽略
+  }
 }
 
 /** 读一块数据并重置看门狗；不产生额外的 Promise */
@@ -1031,7 +1053,7 @@ async function collectCcStream(response, idleTimeoutMs) {
   };
 
   const watcher = createIdleWatcher(idleTimeoutMs, () => {
-    try { reader.cancel(); } catch {}
+    cancelReader(reader);
   });
 
   try {
@@ -1048,7 +1070,7 @@ async function collectCcStream(response, idleTimeoutMs) {
     for (let i = 0; i < rest.length; i++) handleLine(rest[i]);
   } finally {
     watcher.stop();
-    try { reader.cancel(); } catch {}
+    cancelReader(reader);
   }
 
   return out;
@@ -1504,7 +1526,7 @@ async function* createAnthropicSseTranslator(response, model, messageId, ctx) {
   const decoder = new TextDecoder();
   const lineBuf = new LineBuffer();
   const watcher = createIdleWatcher(CFG.streamIdleTimeoutMs, () => {
-    try { reader.cancel(); } catch {}
+    cancelReader(reader);
   });
 
   try {
@@ -1549,7 +1571,7 @@ async function* createAnthropicSseTranslator(response, model, messageId, ctx) {
   } finally {
     watcher.stop();
     // 确保流中断时通知上游
-    try { reader.cancel(); } catch {}
+    cancelReader(reader);
   }
 }
 
@@ -1708,7 +1730,7 @@ async function handleChatCompletions(request, ctx) {
       // 单个静默看门狗，贯穿预缓冲与后续转发（不再每次 read 建一个定时器）
       const watcher = createIdleWatcher(CFG.streamIdleTimeoutMs, () => {
         try { abortController.abort(); } catch {}
-        try { reader.cancel(); } catch {}
+        cancelReader(reader);
       });
 
       // 先缓冲到第一段可见内容，这样上游 401/429 之类仍能以 JSON 返回。
@@ -1743,7 +1765,7 @@ async function handleChatCompletions(request, ctx) {
 
       if (streamError) {
         watcher.stop();
-        try { reader.cancel(); } catch {}
+        cancelReader(reader);
         try { abortController.abort(); } catch {}
         if (streamError.message === 'STREAM_IDLE_TIMEOUT') {
           consecutiveTimeouts++;
@@ -1790,7 +1812,7 @@ async function handleChatCompletions(request, ctx) {
                 // 客户端断开
                 finished = true;
                 watcher.stop();
-                try { reader.cancel(); } catch {}
+                cancelReader(reader);
                 try { controller.close(); } catch {}
                 return;
               }
@@ -1874,7 +1896,7 @@ async function handleChatCompletions(request, ctx) {
           } catch (e) {
             finished = true;
             watcher.stop();
-            try { reader.cancel(); } catch {}
+            cancelReader(reader);
             if (e && e.message === 'STREAM_IDLE_TIMEOUT') {
               log('warn', 'Stream idle timeout', {
                 path: '/v1/chat/completions', model, streaming: true,
@@ -1909,7 +1931,7 @@ async function handleChatCompletions(request, ctx) {
           finished = true;
           watcher.stop();
           try { abortController.abort(); } catch {}
-          try { reader?.cancel(); } catch {}
+          cancelReader(reader);
         },
       });
 
@@ -1978,7 +2000,7 @@ async function handleChatCompletions(request, ctx) {
         timeoutMs: CFG.nonstreamIdleTimeoutMs, elapsedMs: Date.now() - startTime,
         id: completionId, bytesReceived, lastCcEvent: lastCcEvent || '(none)',
       });
-      try { reader?.cancel(); } catch {}
+      cancelReader(reader);
       try { abortController.abort(); } catch {}
       consecutiveTimeouts++;
       const timeoutMsg = consecutiveTimeouts >= TIMEOUT_REDUCE_CONTEXT_THRESHOLD
@@ -2217,7 +2239,7 @@ async function handleMessages(request, ctx) {
         path: '/v1/messages', model, streaming: false,
         timeoutMs: CFG.nonstreamIdleTimeoutMs, elapsedMs: Date.now() - startTime, id: messageId,
       });
-      try { reader?.cancel(); } catch {}
+      cancelReader(reader);
       try { abortController.abort(); } catch {}
       consecutiveTimeouts++;
       const timeoutMsg = consecutiveTimeouts >= TIMEOUT_REDUCE_CONTEXT_THRESHOLD

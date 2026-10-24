@@ -13,6 +13,7 @@
 - <code>cache_control</code> 透传
 - 按 API Key 隔离的 session 和设备指纹
 - 低 CPU 占用：单个空闲看门狗、增量行解析、流式增量合并
+- **可在本地直接跑**（`npm run serve`），不需要 Cloudflare，也没有 CPU 时间计费
 - 可选 Cloudflare KV，跨 Worker 冷启动和 isolate 复用状态
 - GitHub Actions 自动部署
 
@@ -25,14 +26,48 @@
 ## 目录结构
 
 ~~~text
-src/index.js                 Worker 入口、协议转换和上游代理
-wrangler.toml                Wrangler 配置
-.github/workflows/deploy.yml GitHub Actions 部署流程
+src/index.js     Worker 入口、协议转换和上游代理（标准 Web API，可移植）
+server.mjs       本地运行的 Node HTTP 适配入口（不经过 Cloudflare）
+wrangler.toml    Wrangler 配置
+test/            回归测试与 CPU 基准
 ~~~
+
+## 两种运行方式
+
+| 方式 | 适合 | CPU 计费 | 说明 |
+|---|---|---|---|
+| **本地 Node 进程**（`npm run serve`） | 只在自己的电脑上用 | 无 | 零成本，无 10ms/30s 上限，无冷启动；电脑关机则不可用 |
+| **Cloudflare Workers** | 手机、其他设备也要访问 | 有（见下文） | 有公网地址；Free 计划 10ms CPU，1MB 级别的请求体会超限 |
+
+> 单机自用强烈建议本地运行：同样的请求在 Workers Free 上会因为 10ms CPU 预算直接 503，
+> 在本地则完全没有这个限制。
 
 ## 快速开始
 
-### 本地开发
+### 本地运行（推荐，零成本）
+
+~~~bash
+npm run serve            # 默认 http://127.0.0.1:8787
+PORT=9000 npm run serve  # 换端口
+~~~
+
+然后把客户端的 base_url 指过去：
+
+~~~bash
+export OPENAI_BASE_URL=http://127.0.0.1:8787/v1
+export OPENAI_API_KEY=user_xxxxxxxxx
+# Anthropic 客户端：ANTHROPIC_BASE_URL=http://127.0.0.1:8787
+~~~
+
+- 配置从 `.dev.vars` 读取（和 wrangler 用同一个文件），进程环境变量优先：
+  ~~~text
+  CC_API_KEY=user_xxxxxxxxx      # 可选：不配就在请求头里带
+  CC_API_BASE=https://api.commandcode.ai
+  ~~~
+- 不需要 KV：session 和指纹保存在进程内存里，进程重启会重新生成。
+- 支持同样的接口：`/v1/chat/completions`、`/v1/messages`、`/v1/models`、`/health`。
+
+### Cloudflare 本地开发
 
 ~~~bash
 npm install
@@ -288,7 +323,8 @@ CC_NONSTREAM_IDLE_TIMEOUT_MS = "90000"   # 非流式：默认 90s
 ## 常用命令
 
 ~~~bash
-npm run dev       # 本地开发
+npm run serve     # 本地运行（不经过 Cloudflare，零成本）
+npm run dev       # Cloudflare 本地开发
 npm run deploy    # 部署 Worker
 npm run tail      # 查看线上日志
 npm test          # 协议/超时/定时器泄漏回归测试
