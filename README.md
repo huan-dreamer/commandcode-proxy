@@ -12,6 +12,7 @@
 - Reasoning / thinking 内容转换
 - <code>cache_control</code> 透传
 - 按 API Key 隔离的 session 和设备指纹
+- 低 CPU 占用：单个空闲看门狗、增量行解析、流式增量合并
 - 可选 Cloudflare KV，跨 Worker 冷启动和 isolate 复用状态
 - GitHub Actions 自动部署
 
@@ -201,6 +202,69 @@ curl https://<worker-domain>/v1/messages \
 | <code>GET</code> | <code>/health</code> | <code>OK</code> | 健康检查 |
 | <code>GET</code> | <code>/</code> | <code>OK</code> | 健康检查 |
 
+## 性能与 CPU 限制
+
+Cloudflare Workers 的 CPU 时间只统计真正的计算，**不包括等待网络的时间**。但流式代理的
+计算是随着上游 token 持续累积的：一次长回答可能有上千个上游数据块，每块都要解析、转换、
+序列化。一旦累计计算超过计划上限，Cloudflare 会返回 **Error 1102**（`Worker exceeded
+resource limits`），在 Dashboard 的 **Metrics → Errors → Invocation Statuses** 里显示为
+`Exceeded CPU Time Limits`，Logpush/analytics 里的 invocation outcome 是 `exceededCpu`。
+
+| 计划 | 单次请求 CPU 上限 |
+|---|---|
+| Free | 10 ms |
+| Paid | 默认 30 s，最高可调到 5 min |
+
+Paid 计划想放宽上限，在 `wrangler.toml` 里加：
+
+~~~toml
+[limits]
+cpu_ms = 300000   # 最大 300000（5 分钟），默认 30000
+~~~
+
+**因此：需要长回答/大上下文时请使用 Paid 计划**，Free 计划的 10 ms 对任何流式代理都偏紧。
+另外注意 Error 1102 也可能是**内存**超限（每 isolate 128 MB），非流式请求会把整段结果缓冲
+在内存里，长输出请用 `stream: true`。
+
+> 另一个容易忽略的上限：单次请求的日志配额是 **256 KB**。逐事件打日志的写法会先把这个
+> 配额用光，之后的日志（包括报错）全部丢失，所以本实现只对未知事件类型打一次日志。
+
+当前实现已针对该上限做了以下处理（可用 `npm run bench` 自行复测）：
+
+1. **不再每次读取都新建定时器。** 旧实现用 `Promise.race([reader.read(), setTimeout(...)])`
+   做空闲超时，但定时器从不清理：一次流式请求会泄漏成百上千个定时器，它们在 30s/90s 后
+   集中触发，既消耗 CPU 又产生无人处理的 rejection。现在整个响应只有 1 个看门狗定时器。
+2. **增量行解析。** 不再对整块缓冲区反复 `split('\n')`；只扫描新到达的字节，
+   避免单行很大时（工具调用参数）出现 O(n²) 扫描。
+3. **流式增量合并。** 同一次上游读取里的多个 `text-delta` 合并成一个 SSE chunk。
+   以 6000 个 delta 为例，下游 SSE 帧数从 6603 降到约 100（取决于上游 flush 粒度）。
+4. **SSE 外壳预拼接。** 热路径只对正文做 `JSON.stringify`，不再每个 delta 构造对象图。
+5. **未知事件只记一次日志。** 避免某个新事件类型让日志量与 CPU 一起爆掉。
+
+本地基准（`npm run bench`，6000 个上游事件，Node 22）：
+
+| 场景 | 优化前 | 优化后 |
+|---|---|---|
+| OpenAI 流式（4KB 块） | 162 ms | 50 ms |
+| OpenAI 流式（150B 块，接近逐 token） | 240 ms | 142 ms |
+| Anthropic 流式（4KB 块） | 166 ms | 54 ms |
+| Anthropic 流式（150B 块） | 228 ms | 128 ms |
+| 泄漏的定时器 | 96 ~ 2203 个 | 0 |
+
+> 数值随上游 flush 粒度、模型输出长度变化；重点是"不再随事件数线性堆积定时器"。
+> 复测方式：`EVENTS=6000 FLUSH=150 npm run bench`（`FLUSH` 越小越接近逐 token 刷）。
+
+### 空闲超时可配置
+
+~~~toml
+[vars]
+CC_STREAM_IDLE_TIMEOUT_MS = "30000"      # 流式：多久没有新数据就中断（默认 30s）
+CC_NONSTREAM_IDLE_TIMEOUT_MS = "90000"   # 非流式：默认 90s
+~~~
+
+超时只在**等待上游**时计时：客户端读得慢（背压）不会被误判成超时。
+超时后流式请求会在 SSE 中返回一个 `rate_limit_error` 事件，非流式返回 `429`。
+
 ## 流式与非流式请求
 
 生产环境优先使用：
@@ -227,6 +291,8 @@ curl https://<worker-domain>/v1/messages \
 npm run dev       # 本地开发
 npm run deploy    # 部署 Worker
 npm run tail      # 查看线上日志
+npm test          # 协议/超时/定时器泄漏回归测试
+npm run bench     # 本地 CPU 基准（可加 EVENTS / FLUSH 环境变量）
 npx wrangler deploy --dry-run  # 仅校验部署配置
 ~~~
 
@@ -243,6 +309,18 @@ npx wrangler deploy --dry-run  # 仅校验部署配置
 ### 返回非流式长度限制
 
 将请求改为 <code>stream: true</code>。如果客户端必须使用非流式，将 <code>max_tokens</code> 调整到 <code>16384</code> 或更低。
+
+### 仍然出现 `exceeded CPU time limit`
+
+按顺序检查：
+
+1. 是否在 Free 计划（10ms CPU）。长回答基本必然超限，需要升级到 Paid。
+2. 是否用了非流式（`stream: false`）跑长回答：非流式需要把整段结果缓冲在内存里，
+   代理限制了 16384 输出 token。长输出请用 `stream: true`。
+3. 上下文是否极大（几十万 token）：`JSON.parse` 请求体本身就是可观的计算量，
+   尽量压缩历史消息。
+4. 用 `npm run tail` 看日志里是否有大量 `Unknown CC event type`——已做去重，
+   若仍大量出现说明上游有新事件类型，可按需在解析里显式忽略。
 
 ### Session 或指纹发生变化
 

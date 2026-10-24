@@ -9,6 +9,11 @@ CC_API_BASE = "https://api.commandcode.ai"
 PROJECT_SLUG = "cc-proxy"
 CC_USE_PROVIDER_MODELS = "true"
 
+# 空闲超时（毫秒）。上游慢/抖动大时可放宽；想更快失败并让客户端重试时可收紧。
+# 说明见 README「性能与 CPU 限制」。
+# CC_STREAM_IDLE_TIMEOUT_MS = "30000"
+# CC_NONSTREAM_IDLE_TIMEOUT_MS = "90000"
+
 # 持久化每个 API Key 的 session / fingerprint。首次部署时由 Wrangler 自动创建并绑定。
 [[kv_namespaces]]
 binding = "CC_STATE"
@@ -16,6 +21,10 @@ binding = "CC_STATE"
 [observability.logs]
 enabled = true
 invocation_logs = true
+
+# 可选：把 CPU 上限显式写出来（需要 Workers Paid 计划；Free 计划固定 10ms，写了会部署失败）
+# [limits]
+# cpu_ms = 30000
 
 # Optional fallback API key (prefer per-request Authorization header):
 # npx wrangler secret put CC_API_KEY

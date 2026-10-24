@@ -9,7 +9,10 @@
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "tail": "wrangler tail",
-    "start": "wrangler dev"
+    "start": "wrangler dev",
+    "test": "node --test test/*.test.mjs",
+    "bench": "node test/bench.mjs stream",
+    "check": "node --check src/index.js"
   },
   "engines": {
     "node": ">=18.0.0"

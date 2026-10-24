@@ -8,6 +8,14 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 
 
+const MAX_BODY_SIZE = 10 * 1024 * 1024; // 10MB — 请求体大小上限
+const STREAM_IDLE_TIMEOUT_MS = 30000;   // 30s — 流式无新数据中断（默认值）
+const NONSTREAM_IDLE_TIMEOUT_MS = 90000; // 90s — 非流式超时更宽容（默认值）
+const SSE_KEEPALIVE_INTERVAL_MS = 15000; // 15s — 静默期才发 keepalive，避免刷屏
+const DEFAULT_MAX_TOKENS = 64000;
+const MAX_NONSTREAM_OUTPUT_TOKENS = 16384; // 非流式保护上限，长输出请使用 stream=true
+
+
 // ── 配置（Workers env） ───────────────────────────
 function loadConfig(env = {}) {
   return {
@@ -17,6 +25,9 @@ function loadConfig(env = {}) {
     logLevel: env.LOG_LEVEL || 'info',
     useProviderModels: env.CC_USE_PROVIDER_MODELS !== 'false',
     modelRefreshIntervalMs: parseInt(env.MODEL_REFRESH_INTERVAL_MS || String(5 * 60 * 1000), 10),
+    // 空闲超时可按部署调整：上游较慢时可放宽，想更快失败时可收紧。
+    streamIdleTimeoutMs: parseInt(env.CC_STREAM_IDLE_TIMEOUT_MS || String(STREAM_IDLE_TIMEOUT_MS), 10),
+    nonstreamIdleTimeoutMs: parseInt(env.CC_NONSTREAM_IDLE_TIMEOUT_MS || String(NONSTREAM_IDLE_TIMEOUT_MS), 10),
     state: env.CC_STATE || null,
   };
 }
@@ -125,12 +136,6 @@ async function maybeRefreshCCVersion() {
 }
 
 
-const MAX_BODY_SIZE = 10 * 1024 * 1024; // 10MB — 请求体大小上限
-const STREAM_IDLE_TIMEOUT_MS = 30000;   // 30s — 流式无新数据中断
-const NONSTREAM_IDLE_TIMEOUT_MS = 90000; // 90s — 非流式超时更宽容
-const SSE_KEEPALIVE_INTERVAL_MS = 15000; // 15s — 静默期才发 keepalive，避免刷屏
-const DEFAULT_MAX_TOKENS = 64000;
-const MAX_NONSTREAM_OUTPUT_TOKENS = 16384; // 非流式保护上限，长输出请使用 stream=true
 
 // 连续超时计数：连续 3 次超时才提醒压缩上下文，任意成功请求后重置
 let consecutiveTimeouts = 0;
@@ -140,6 +145,144 @@ const TIMEOUT_REDUCE_CONTEXT_THRESHOLD = 3;
 function log(level, msg, data) {
   const line = `[${new Date().toISOString()}] [${level}] ${msg}${data ? ' ' + JSON.stringify(data) : ''}`;
   console.log(line);
+}
+
+// ── 流式解析工具（CPU 敏感路径） ─────────────────────
+// 原实现在每次 reader.read() 前都新建一个 setTimeout 做竞速，而且从不清理。
+// 一个流式请求会泄漏大量定时器（真实的上游往往每 token 一次 flush，很容易上千个），
+// 它们在 30s/90s 后集中触发：既白烧 CPU，又产生无人处理的 rejection。
+// Workers 的 "Exceeded timeout / CPU time limit" 常见成因就在这里。
+//
+// 现在改为"单个看门狗"：整个响应只保留 1 个定时器，仅在真正静默时才触发。
+// 静默超时后取消 reader，挂起的 read() 会以 done 结束，由调用方按超时处理。
+function createIdleWatcher(timeoutMs, onIdle) {
+  let timer = null;
+  let last = Date.now();
+  let closed = false;   // 本次响应已结束
+  let paused = false;   // 正在等客户端拉取，而不是等上游
+  let fired = false;
+
+  function check() {
+    timer = null;
+    if (closed) return;
+    // 等客户端时不算空闲：客户端慢 ≠ 上游卡住。
+    // 定时器不销毁重建，只是退化成低频轮询（每个超时周期一次），避免每个 pull 都新建定时器。
+    if (paused) {
+      timer = setTimeout(check, timeoutMs);
+      return;
+    }
+    const idle = Date.now() - last;
+    if (idle >= timeoutMs) {
+      fired = true;
+      closed = true;
+      if (onIdle) onIdle();
+      return;
+    }
+    timer = setTimeout(check, timeoutMs - idle);
+  }
+  timer = setTimeout(check, timeoutMs);
+
+  return {
+    /** 开始等上游数据（或收到数据）时调用 */
+    resume() {
+      if (closed) return;
+      paused = false;
+      last = Date.now();
+      if (timer === null) timer = setTimeout(check, timeoutMs);
+    },
+    /** 把数据交给客户端、等待它继续拉取时调用 */
+    pause() {
+      paused = true;
+    },
+    /** 收到数据时调用，重置静默计时 */
+    touch() {
+      if (!closed) last = Date.now();
+    },
+    stop() {
+      closed = true;
+      if (timer !== null) { clearTimeout(timer); timer = null; }
+    },
+    get timedOut() { return fired; },
+  };
+}
+
+/** 读一块数据并重置看门狗；不产生额外的 Promise */
+async function readStream(reader, watcher) {
+  const result = await reader.read();
+  watcher.touch();
+  return result;
+}
+
+// 增量行缓冲：只扫描新到达的字节，不再对整块缓冲区反复 split()/indexOf()，
+// 避免大 NDJSON 行（工具调用参数等）导致的 O(n²) 扫描。
+class LineBuffer {
+  constructor() {
+    this.buf = '';
+    this.scanned = 0; // 已确认没有换行的前缀长度，避免重复扫描
+  }
+
+  /** 追加文本，返回本次凑齐的所有完整行 */
+  push(text) {
+    this.buf += text;
+    const lines = [];
+    let start = 0;
+    let idx = this.buf.indexOf('\n', this.scanned);
+    while (idx !== -1) {
+      lines.push(this.buf.slice(start, idx));
+      start = idx + 1;
+      idx = this.buf.indexOf('\n', start);
+    }
+    if (start > 0) {
+      this.buf = this.buf.slice(start);
+      this.scanned = 0;
+    } else {
+      this.scanned = this.buf.length;
+    }
+    return lines;
+  }
+
+  /** 流结束时取出残余（可能是未以 \n 结尾的最后一行） */
+  drain() {
+    const rest = this.buf;
+    this.buf = '';
+    this.scanned = 0;
+    return rest ? [rest] : [];
+  }
+}
+
+// 常见且无用户可见内容的 CC 事件，直接跳过，不做任何分配。
+const CC_SILENT_EVENTS = new Set([
+  'start', 'start-step', 'text-start', 'text-end',
+  'reasoning-start', 'reasoning-end', 'provider-metadata',
+  'tool-input-start', 'tool-input-delta', 'tool-input-end', 'tool-error',
+]);
+
+// 未知事件类型只记录一次：若某事件每个 chunk 都出现，逐条 log() 会同时打满
+// CPU 与日志配额（wrangler 上 invocation_logs 是开启的）。
+const seenUnknownEvents = new Set();
+function logUnknownEvent(type) {
+  if (seenUnknownEvents.has(type) || seenUnknownEvents.size >= 64) return;
+  seenUnknownEvents.add(type);
+  log('warn', 'Unknown CC event type', { type });
+}
+
+/** 解析一行上游 NDJSON；非常规行（空行、[DONE]、SSE 注释）返回 null */
+function parseCcLine(line) {
+  const first = line.charCodeAt(0);
+  if (first !== 123 /* { */) {
+    if (first === 58 /* : */) return null;
+    let end = line.length - 1;
+    while (end >= 0 && (line.charCodeAt(end) === 32 || line.charCodeAt(end) === 13 || line.charCodeAt(end) === 9)) end--;
+    if (end < 0) return null;
+    if (line.charCodeAt(0) === 58) return null;
+    if (end === 5 && line.startsWith('[DONE]')) return null;
+  }
+  try {
+    const event = JSON.parse(line);
+    return (event && typeof event === 'object' && event.type) ? event : null;
+  } catch {
+    return null;
+  }
 }
 
 /** Emit a structured usage line for wrangler tail / Logpush aggregation. */
@@ -675,139 +818,139 @@ function tryParseJSON(str) {
 }
 
 // ── CC NDJSON → OpenAI SSE 转换 ────────────────────
-
+// 性能要点：
+//  1) 每个 chunk 的固定 JSON 外壳只拼接一次（HEAD/TAIL），热路径只对 text 做
+//     JSON.stringify，避免每个 delta 都构造对象图再整体序列化。
+//  2) 同一批上游数据（一次 reader.read()）里的多个 text-delta 合并成 1 个 SSE
+//     chunk：上游通常每几十字节 flush 一次，逐条转发会让代理侧的序列化/入队
+//     开销放大几十倍，而客户端拿到的仍是连续文本。
 function createSseTranslator(model, completionId, created) {
-  let chunkIndex = 0;
-  let sentRole = false;
-  let finishReason = null;
-  let usage = null;
-  let toolCallIndex = 0;
+  const HEAD = 'data: {"id":"' + completionId
+    + '","object":"chat.completion.chunk","created":' + created
+    + ',"model":' + JSON.stringify(model)
+    + ',"choices":[{"index":0,"delta":';
+  const TAIL = ',"finish_reason":null}]}\n\n';
 
-  return {
+  let firstChunk = true;
+  let pendingText = '';
+  let pendingReasoning = '';
+  let toolCallIndex = 0;
+  let finishReason = null;
+
+  const translator = {
     lastCcEvent: '',
     inputTokens: 0,
     outputTokens: 0,
     cachedInputTokens: 0,
-    /** 解析一行 NDJSON，返回 OpenAI chunk 数组 */
-    parseLine(line) {
-      const trimmed = line.trim();
-      if (!trimmed || trimmed === '[DONE]' || trimmed.startsWith(':')) return null;
 
-      let event;
-      try { event = JSON.parse(trimmed); } catch { return null; }
-      if (!event.type) return null;
-      this.lastCcEvent = event.type;
+    /** 首个 chunk 需要带 role */
+    takeRole() {
+      if (!firstChunk) return '';
+      firstChunk = false;
+      return '"role":"assistant",';
+    },
 
-      const out = [];
+    /** 把累计的 reasoning / text 合并成尽量少的 SSE chunk */
+    flushPending() {
+      if (!pendingText && !pendingReasoning) return '';
+      let out = '';
+      if (pendingReasoning) {
+        const text = pendingReasoning;
+        pendingReasoning = '';
+        out += HEAD + '{' + this.takeRole() + '"reasoning_content":' + JSON.stringify(text) + '}' + TAIL;
+      }
+      if (pendingText) {
+        const text = pendingText;
+        pendingText = '';
+        out += HEAD + '{' + this.takeRole() + '"content":' + JSON.stringify(text) + '}' + TAIL;
+      }
+      return out;
+    },
 
-      switch (event.type) {
-        case 'text-start':
-        case 'reasoning-start':
-        case 'start':
-        case 'start-step':
-          // 忽略，无用户可见内容
-          break;
+    /** 解析一行 NDJSON，返回需要发送的 SSE 文本（可能为空） */
+    pushLine(line) {
+      const event = parseCcLine(line);
+      if (!event) return '';
+      const type = event.type;
+      this.lastCcEvent = type;
 
+      switch (type) {
         case 'text-delta': {
           const text = event.text || event.delta || '';
-          if (!text) break;
-          const delta = chunkIndex === 0 ? { role: 'assistant', content: text } : { content: text };
-          chunkIndex++;
-          sentRole = true;
-          out.push(makeChunk(completionId, created, model, delta, null, null));
-          break;
+          if (text) pendingText += text;
+          return '';
         }
 
         case 'reasoning-delta': {
           const text = event.text || '';
-          if (!text) break;
-          const delta = chunkIndex === 0
-            ? { role: 'assistant', reasoning_content: text }
-            : { reasoning_content: text };
-          chunkIndex++;
-          out.push(makeChunk(completionId, created, model, delta, null, null));
-          break;
+          if (text) pendingReasoning += text;
+          return '';
         }
 
         case 'tool-call': {
-          const id = event.toolCallId || `call_${Date.now()}_${toolCallIndex}`;
+          let out = this.flushPending();
+          const id = event.toolCallId || ('call_' + created + '_' + toolCallIndex);
           const name = event.toolName || '';
           const args = typeof event.input === 'string' ? event.input : JSON.stringify(event.input || {});
-          const tcEntry = { index: toolCallIndex, id, type: 'function', function: { name, arguments: args } };
-          const delta = chunkIndex === 0
-            ? { role: 'assistant', content: null, tool_calls: [tcEntry] }
-            : { tool_calls: [tcEntry] };
-          chunkIndex++;
+          const role = this.takeRole();
+          out += HEAD + '{' + (role ? role + '"content":null,' : '')
+            + '"tool_calls":[{"index":' + toolCallIndex
+            + ',"id":' + JSON.stringify(id)
+            + ',"type":"function","function":{"name":' + JSON.stringify(name)
+            + ',"arguments":' + JSON.stringify(args) + '}}]}' + TAIL;
           toolCallIndex++;
-          out.push(makeChunk(completionId, created, model, delta, null, null));
-          break;
+          return out;
         }
 
         case 'finish-step': {
           if (event.finishReason) finishReason = mapFinishReason(event.finishReason);
           if (event.usage) {
-            usage = event.usage;
             this.inputTokens = event.usage.inputTokens ?? 0;
             this.outputTokens = event.usage.outputTokens ?? 0;
             this.cachedInputTokens = event.usage.cachedInputTokens ?? 0;
           }
-          break;
+          return '';
         }
 
         case 'finish': {
+          let out = this.flushPending();
           const fr = finishReason || mapFinishReason(event.finishReason || 'stop');
-          const u = event.totalUsage || usage || {};
+          const u = event.totalUsage || event.usage || {};
           normalizeUsage(u);
           this.inputTokens = u.inputTokens ?? 0;
           this.outputTokens = u.outputTokens ?? 0;
           this.cachedInputTokens = u.cachedInputTokens ?? 0;
-          const openaiUsage = u ? {
-            prompt_tokens: u.inputTokens ?? 0,
-            completion_tokens: u.outputTokens ?? 0,
-            total_tokens: (u.inputTokens ?? 0) + (u.outputTokens ?? 0),
-            prompt_tokens_details: { cached_tokens: u.cachedInputTokens ?? 0 },
-          } : undefined;
-          out.push(makeChunk(completionId, created, model, {}, fr, openaiUsage));
-          break;
+          const promptTokens = u.inputTokens ?? 0;
+          const completionTokens = u.outputTokens ?? 0;
+          out += HEAD + '{},"finish_reason":' + JSON.stringify(fr) + '}],"usage":{'
+            + '"prompt_tokens":' + promptTokens
+            + ',"completion_tokens":' + completionTokens
+            + ',"total_tokens":' + (promptTokens + completionTokens)
+            + ',"prompt_tokens_details":{"cached_tokens":' + (u.cachedInputTokens ?? 0)
+            + '}}}\n\n';
+          return out;
         }
 
         case 'error': {
-          const msg = event.error?.message || event.message || 'Unknown error';
-          log('warn', 'CC stream error', { message: msg });
-          // Don't emit a finish_reason chunk — let the natural stream termination
-          // handle it. Otherwise a subsequent finish(tool_calls) would be ignored
-          // by downstream agent loops that stop at the first finish_reason.
-          break;
+          log('warn', 'CC stream error', { message: event.error?.message || event.message || 'Unknown error' });
+          // 不发 finish_reason chunk，交给流自然结束处理。
+          return '';
         }
 
-        case 'reasoning-end': case 'provider-metadata': case 'tool-input-start': case 'tool-input-delta': case 'tool-input-end': case 'tool-error': case 'text-end':
-          // Silent - no user-visible content
-          break;
-        default:
-          log('warn', 'Unknown CC event type', { type: event.type });
-          break;
+        default: {
+          if (!CC_SILENT_EVENTS.has(type)) logUnknownEvent(type);
+          return '';
+        }
       }
-
-      return out.length > 0 ? out : null;
     },
 
-    /** 获取 SSE 结束标记 */
+    /** SSE 结束标记 */
     getDoneEvent() {
       return 'data: [DONE]\n\n';
     },
   };
-}
 
-function makeChunk(id, created, model, delta, finishReason, usage) {
-  const chunk = {
-    id,
-    object: 'chat.completion.chunk',
-    created,
-    model,
-    choices: [{ index: 0, delta, finish_reason: finishReason || null }],
-  };
-  if (usage) chunk.usage = usage;
-  return `data: ${JSON.stringify(chunk)}\n\n`;
+  return translator;
 }
 
 // normalize CC usage stats:
@@ -828,6 +971,87 @@ function mapFinishReason(reason) {
     case 'stop': return 'stop';
     default: return reason || 'stop';
   }
+}
+
+// 非流式请求：把上游 NDJSON 完整读进内存后组装。
+// 两种协议共用同一份收集逻辑，避免重复的解析循环各自漂移。
+async function collectCcStream(response, idleTimeoutMs) {
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  const lineBuf = new LineBuffer();
+  const out = {
+    text: '',
+    reasoning: '',
+    toolCalls: null,
+    finishReason: 'stop',
+    usage: null,
+    bytes: 0,
+    lastEvent: '',
+    sawError: false,
+  };
+
+  const handleLine = (line) => {
+    const event = parseCcLine(line);
+    if (!event) return;
+    const type = event.type;
+    out.lastEvent = type;
+
+    switch (type) {
+      case 'text-delta':
+        out.text += event.text || '';
+        break;
+      case 'reasoning-delta':
+        out.reasoning += event.text || '';
+        break;
+      case 'tool-call':
+        (out.toolCalls || (out.toolCalls = [])).push({
+          id: event.toolCallId || ('call_' + randomUUID().slice(0, 8)),
+          type: 'function',
+          function: {
+            name: event.toolName || '',
+            arguments: typeof event.input === 'string' ? event.input : JSON.stringify(event.input || {}),
+          },
+        });
+        break;
+      case 'finish-step':
+        if (event.finishReason) out.finishReason = mapFinishReason(event.finishReason);
+        break;
+      case 'finish':
+        out.finishReason = mapFinishReason(event.finishReason || 'stop');
+        if (event.totalUsage) out.usage = event.totalUsage;
+        break;
+      case 'error':
+        out.sawError = true;
+        log('warn', 'CC stream error (non-stream)', { message: event.error?.message || event.message });
+        break;
+      default:
+        if (!CC_SILENT_EVENTS.has(type)) logUnknownEvent(type);
+        break;
+    }
+  };
+
+  const watcher = createIdleWatcher(idleTimeoutMs, () => {
+    try { reader.cancel(); } catch {}
+  });
+
+  try {
+    watcher.resume();
+    for (;;) {
+      const { done, value } = await readStream(reader, watcher);
+      if (done) break;
+      out.bytes += value.length;
+      const lines = lineBuf.push(decoder.decode(value, { stream: true }));
+      for (let i = 0; i < lines.length; i++) handleLine(lines[i]);
+    }
+    if (watcher.timedOut) throw new Error('STREAM_IDLE_TIMEOUT');
+    const rest = lineBuf.drain();
+    for (let i = 0; i < rest.length; i++) handleLine(rest[i]);
+  } finally {
+    watcher.stop();
+    try { reader.cancel(); } catch {}
+  }
+
+  return out;
 }
 
 // ── 错误映射 ───────────────────────────────────────
@@ -857,8 +1081,9 @@ function mapCcError(ccStatus, ccBody) {
     }
   }
 
-  // CC 429 响应可能带 retry-after
-  if (ccStatus === 429) {
+  // 限流类错误（含 402 余额不足映射来的 429）都带上 Retry-After，
+  // 让客户端按退避重试，而不是立刻重打把配额/CPU 一起打满。
+  if (mapped.status === 429 || ccStatus === 429) {
     return {
       status: 429,
       body: {
@@ -1139,50 +1364,130 @@ async function* createAnthropicSseTranslator(response, model, messageId, ctx) {
   let cacheWriteTokens = 0;
   let stopReason = null;
   let hasError = false;
-  let currentThinkingText = ''; // accumulated thinking text for the open block
+  let currentThinkingText = ''; // 当前 thinking block 累计的文本，用于签名
+  let pendingText = '';
+  let pendingThinking = '';
 
-  // Close the current block (text or thinking) if one is active.
-  // Thinking blocks receive a signature_delta before content_block_stop.
+  // 关闭当前 block（text 或 thinking）。
+  // thinking block 需要先发 signature_delta 再发 content_block_stop。
   function closeBlock() {
-    if (blockStarted) {
-      const idx = currentBlockIndex;
-      const type = currentBlockType;
-      let out = '';
-      if (type === 'thinking') {
-        out += `event: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', index: idx, delta: { type: 'signature_delta', signature: fakeThinkingSignature(currentThinkingText) } })}\n\n`;
-        currentThinkingText = '';
-      }
-      blockStarted = false;
-      currentBlockType = null;
-      return out + `event: content_block_stop\ndata: ${JSON.stringify({ type: 'content_block_stop', index: idx })}\n\n`;
+    if (!blockStarted) return '';
+    const idx = currentBlockIndex;
+    let out = '';
+    if (currentBlockType === 'thinking') {
+      out += `event: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', index: idx, delta: { type: 'signature_delta', signature: fakeThinkingSignature(currentThinkingText) } })}\n\n`;
+      currentThinkingText = '';
     }
-    return '';
+    blockStarted = false;
+    currentBlockType = null;
+    return out + `event: content_block_stop\ndata: ${JSON.stringify({ type: 'content_block_stop', index: idx })}\n\n`;
   }
-  const closeTextBlock = closeBlock;
 
-  // Open a new block of the given type (closing any previous block first)
+  // 打开指定类型的新 block（先关闭上一个）
   function startBlock(type, contentBlock) {
-    if (!blockStarted || currentBlockType !== type) {
-      const close = closeBlock();
-      currentBlockIndex = nextBlockIndex++;
-      currentBlockType = type;
-      blockStarted = true;
-      return close + `event: content_block_start\ndata: ${JSON.stringify({ type: 'content_block_start', index: currentBlockIndex, content_block: contentBlock })}\n\n`;
+    if (blockStarted && currentBlockType === type) return '';
+    const out = closeBlock();
+    currentBlockIndex = nextBlockIndex++;
+    currentBlockType = type;
+    blockStarted = true;
+    return out + `event: content_block_start\ndata: ${JSON.stringify({ type: 'content_block_start', index: currentBlockIndex, content_block: contentBlock })}\n\n`;
+  }
+
+  // 把累计的 thinking / text 合并成尽量少的 delta 事件（同一次上游读取内）
+  function flushPending() {
+    if (!pendingThinking && !pendingText) return '';
+    let out = '';
+    if (pendingThinking) {
+      const text = pendingThinking;
+      pendingThinking = '';
+      out += startBlock('thinking', { type: 'thinking', thinking: '' });
+      currentThinkingText += text;
+      out += `event: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', index: currentBlockIndex, delta: { type: 'thinking_delta', thinking: text } })}\n\n`;
     }
-    return '';
+    if (pendingText) {
+      const text = pendingText;
+      pendingText = '';
+      out += startBlock('text', { type: 'text', text: '' });
+      out += `event: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', index: currentBlockIndex, delta: { type: 'text_delta', text } })}\n\n`;
+    }
+    return out;
   }
 
-  // Open a new text block (closing any previous block first)
-  function startTextBlock() {
-    return startBlock('text', { type: 'text', text: '' });
+  /** 处理一行 NDJSON，返回要发送的 SSE 文本（可能为空） */
+  function handleLine(line) {
+    const event = parseCcLine(line);
+    if (!event) return '';
+    ctx.lastCcEvent = event.type;
+
+    switch (event.type) {
+      case 'reasoning-delta': {
+        // CC reasoning → Anthropic thinking block
+        const text = event.text || '';
+        if (text) pendingThinking += text;
+        return '';
+      }
+
+      case 'text-delta': {
+        const text = event.text || '';
+        if (text) pendingText += text;
+        outputTokens += 1;
+        return '';
+      }
+
+      case 'tool-call': {
+        // 先关闭待处理的 text block
+        let out = flushPending();
+        out += closeBlock();
+
+        const id = event.toolCallId || `toolu_${randomUUID().slice(0, 12)}`;
+        const name = event.toolName || '';
+        const input = typeof event.input === 'string' ? event.input : JSON.stringify(event.input || {});
+
+        const tcIndex = nextBlockIndex++;
+        out += `event: content_block_start\ndata: ${JSON.stringify({ type: 'content_block_start', index: tcIndex, content_block: { type: 'tool_use', id, name, input: {} } })}\n\n`;
+        out += `event: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', index: tcIndex, delta: { type: 'input_json_delta', partial_json: input } })}\n\n`;
+        out += `event: content_block_stop\ndata: ${JSON.stringify({ type: 'content_block_stop', index: tcIndex })}\n\n`;
+        outputTokens += 20;
+        return out;
+      }
+
+      case 'finish-step':
+      case 'finish': {
+        // CC 用的是 'tool-calls'/'length'，先规范成 OpenAI 风格再映射到 Anthropic
+        if (event.finishReason) stopReason = mapAnthropicStopReason(mapFinishReason(event.finishReason));
+        const u = event.totalUsage || event.usage;
+        if (u) {
+          normalizeUsage(u);
+          inputTokens = u.inputTokens ?? inputTokens;
+          outputTokens = u.outputTokens ?? outputTokens;
+          cachedInputTokens = u.cachedInputTokens ?? cachedInputTokens;
+          cacheWriteTokens = u.inputTokenDetails?.cacheWriteTokens ?? cacheWriteTokens;
+        } else {
+          inputTokens = 0;
+          outputTokens = 0;
+          cachedInputTokens = 0;
+          cacheWriteTokens = 0;
+        }
+        ctx.inputTokens = inputTokens;
+        ctx.outputTokens = outputTokens;
+        ctx.cachedInputTokens = cachedInputTokens;
+        return '';
+      }
+
+      case 'error': {
+        hasError = true;
+        const msg = event.error?.message || event.message || 'Unknown CC error';
+        return `event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'internal_error', message: msg } })}\n\n`;
+      }
+
+      default: {
+        if (!CC_SILENT_EVENTS.has(event.type)) logUnknownEvent(event.type);
+        return '';
+      }
+    }
   }
 
-  // Open a new thinking block (closing any previous block first)
-  function startThinkingBlock() {
-    return startBlock('thinking', { type: 'thinking', thinking: '' });
-  }
-
-  // Emit message_start (always the first event)
+  // message_start 永远是第一个事件
   yield `event: message_start\ndata: ${JSON.stringify({
     type: 'message_start',
     message: {
@@ -1197,135 +1502,52 @@ async function* createAnthropicSseTranslator(response, model, messageId, ctx) {
 
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
-  let buffer = '';
+  const lineBuf = new LineBuffer();
+  const watcher = createIdleWatcher(CFG.streamIdleTimeoutMs, () => {
+    try { reader.cancel(); } catch {}
+  });
 
   try {
-    while (true) {
-      const result = await Promise.race([
-        reader.read(),
-        new Promise((_, reject) =>
-          setTimeout(() => reject(new Error('STREAM_IDLE_TIMEOUT')), STREAM_IDLE_TIMEOUT_MS)
-        ),
-      ]);
-      const { done, value } = result;
+    for (;;) {
+      watcher.resume();
+      const { done, value } = await readStream(reader, watcher);
       if (done) break;
       ctx.bytesReceived += value.length;
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop() || '';
-
-      let hadOutput = false;
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed || trimmed === '[DONE]') continue;
-        let event;
-        try { event = JSON.parse(trimmed); } catch { continue; }
-        if (!event.type) continue;
-        ctx.lastCcEvent = event.type;
-
-        switch (event.type) {
-          case 'start': case 'start-step': case 'text-start': case 'reasoning-start':
-            // Signal events, no user-visible data
-            break;
-
-          case 'reasoning-delta': {
-            // CC reasoning → Anthropic thinking block
-            const text = event.text || '';
-            if (!text) break;
-            const startBlockEvent = startThinkingBlock();
-            currentThinkingText += text;
-            yield startBlockEvent + `event: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', index: currentBlockIndex, delta: { type: 'thinking_delta', thinking: text } })}\n\n`;
-            hadOutput = true;
-            break;
-          }
-
-          case 'text-delta': {
-            const text = event.text || '';
-            const startBlock = startTextBlock();
-            yield startBlock + `event: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', index: currentBlockIndex, delta: { type: 'text_delta', text } })}\n\n`;
-            outputTokens += 1;
-            hadOutput = true;
-            break;
-          }
-
-          case 'tool-call': {
-            // Close any pending text block
-            const closeBlock = closeTextBlock();
-            if (closeBlock) yield closeBlock;
-
-            const id = event.toolCallId || `toolu_${randomUUID().slice(0, 12)}`;
-            const name = event.toolName || '';
-            const input = typeof event.input === 'string' ? event.input : JSON.stringify(event.input || {});
-
-            const tcIndex = nextBlockIndex++;
-            yield `event: content_block_start\ndata: ${JSON.stringify({ type: 'content_block_start', index: tcIndex, content_block: { type: 'tool_use', id, name, input: {} } })}\n\n`;
-            yield `event: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', index: tcIndex, delta: { type: 'input_json_delta', partial_json: input } })}\n\n`;
-            yield `event: content_block_stop\ndata: ${JSON.stringify({ type: 'content_block_stop', index: tcIndex })}\n\n`;
-            outputTokens += 20;
-            break;
-          }
-
-          case 'finish-step':
-          case 'finish': {
-            if (event.finishReason) stopReason = mapAnthropicStopReason(event.finishReason);
-            const u = event.totalUsage || event.usage;
-            if (u) {
-              normalizeUsage(u);
-              inputTokens = u.inputTokens ?? inputTokens;
-              outputTokens = u.outputTokens ?? outputTokens;
-              cachedInputTokens = u.cachedInputTokens ?? cachedInputTokens;
-              cacheWriteTokens = u.inputTokenDetails?.cacheWriteTokens ?? cacheWriteTokens;
-              ctx.inputTokens = inputTokens;
-              ctx.outputTokens = outputTokens;
-              ctx.cachedInputTokens = cachedInputTokens;
-            } else {
-              inputTokens = 0;
-              outputTokens = 0;
-              cachedInputTokens = 0;
-              cacheWriteTokens = 0;
-              ctx.inputTokens = 0;
-              ctx.outputTokens = 0;
-              ctx.cachedInputTokens = 0;
-            }
-            break;
-          }
-
-          case 'error': {
-            hasError = true;
-            const msg = event.error?.message || event.message || 'Unknown CC error';
-            yield `event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'internal_error', message: msg } })}\n\n`;
-            break;
-          }
-
-          case 'reasoning-end': case 'provider-metadata': case 'tool-input-start': case 'tool-input-delta': case 'tool-input-end': case 'tool-error': case 'text-end':
-            // Silent - no user-visible content
-            break;
-          default:
-            log('warn', 'Unknown CC event type', { type: event.type });
-            break;
-        }
-      }
+      const lines = lineBuf.push(decoder.decode(value, { stream: true }));
+      let out = '';
+      for (let i = 0; i < lines.length; i++) out += handleLine(lines[i]);
+      out += flushPending();
+      if (out) { watcher.pause(); yield out; }
     }
+    // 静默超时：交给上层按超时错误处理
+    if (watcher.timedOut) throw new Error('STREAM_IDLE_TIMEOUT');
 
-    // Finalize — close pending text block, emit message_delta + message_stop
+    const rest = lineBuf.drain();
+    let tail = '';
+    for (let i = 0; i < rest.length; i++) tail += handleLine(rest[i]);
+    tail += flushPending();
+    if (tail) { yield tail; tail = ''; }
+
+    // 收尾 — 关闭未完成的 block，发 message_delta + message_stop
     if (!hasError) {
-      const closeBlock = closeTextBlock();
-      if (closeBlock) yield closeBlock;
+      tail += closeBlock();
 
       // 输出 token 为 0 时记为错误，避免下游异常计费
       if (outputTokens === 0) {
-        yield `event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: 'Empty response from upstream (zero output tokens)' }, retry_after: 10 })}\n\n`;
+        tail += `event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: 'Empty response from upstream (zero output tokens)' }, retry_after: 10 })}\n\n`;
       } else {
-        yield `event: message_delta\ndata: ${JSON.stringify({
+        tail += `event: message_delta\ndata: ${JSON.stringify({
           type: 'message_delta',
           delta: { stop_reason: stopReason || 'end_turn' },
           usage: { output_tokens: outputTokens, cache_read_input_tokens: cachedInputTokens, cache_creation_input_tokens: cacheWriteTokens || null, input_tokens: inputTokens },
         })}\n\n`;
 
-        yield `event: message_stop\ndata: ${JSON.stringify({ type: 'message_stop' })}\n\n`;
+        tail += `event: message_stop\ndata: ${JSON.stringify({ type: 'message_stop' })}\n\n`;
       }
+      if (tail) yield tail;
     }
   } finally {
+    watcher.stop();
     // 确保流中断时通知上游
     try { reader.cancel(); } catch {}
   }
@@ -1369,29 +1591,39 @@ function corsHeaders() {
   };
 }
 
+// 直接在这些 Response 的 headers 上加 CORS，而不是再造一层
+// `new Response(res.body, ...)`：后者会让每个流式响应多经过一次 body 转接。
 function withCors(res) {
-  const headers = new Headers(res.headers);
-  for (const [k, v] of Object.entries(corsHeaders())) headers.set(k, v);
-  return new Response(res.body, { status: res.status, statusText: res.statusText, headers });
+  try {
+    const cors = corsHeaders();
+    for (const k in cors) res.headers.set(k, cors[k]);
+    return res;
+  } catch {
+    // 极少数不可变 headers 场景下退回重建
+    const headers = new Headers(res.headers);
+    const cors = corsHeaders();
+    for (const k in cors) headers.set(k, cors[k]);
+    return new Response(res.body, { status: res.status, statusText: res.statusText, headers });
+  }
 }
 
 function headerObj(request) {
   const h = {};
-  request.headers.forEach((v, k) => { h[k.toLowerCase()] = v; });
-  // also keep original keys used by getApiKey
-  h['authorization'] = request.headers.get('authorization') || '';
-  h['Authorization'] = h['authorization'];
-  h['x-api-key'] = request.headers.get('x-api-key') || '';
-  h['X-Api-Key'] = h['x-api-key'];
-  h['x-session-id'] = request.headers.get('x-session-id') || undefined;
-  h['x-claude-code-session-id'] = request.headers.get('x-claude-code-session-id') || undefined;
+  // Headers 迭代给出的 key 已经是小写，无需再 toLowerCase() 与多次 get()。
+  for (const [k, v] of request.headers) h[k] = v;
+  h['Authorization'] = h['authorization'] || '';
+  h['X-Api-Key'] = h['x-api-key'] || '';
+  h['x-session-id'] = h['x-session-id'] || undefined;
+  h['x-claude-code-session-id'] = h['x-claude-code-session-id'] || undefined;
   return h;
 }
 
 async function readJson(request) {
-  const text = await request.text();
-  if (text.length > MAX_BODY_SIZE) throw new Error('Request body exceeds 10MB limit');
-  return JSON.parse(text);
+  // 先用 Content-Length 挡掉超大请求，避免把整个 body 读成字符串再丢弃；
+  // request.json() 走运行时原生解析，比 text() + JSON.parse 少一次大字符串分配。
+  const declared = Number(request.headers.get('content-length') || 0);
+  if (declared > MAX_BODY_SIZE) throw new Error('Request body exceeds 10MB limit');
+  return await request.json();
 }
 
 function requestedNonStreamTokens(body) {
@@ -1418,7 +1650,7 @@ function linkAbort(clientSignal, abortController) {
 
 // ── OpenAI Chat Completions ──────────────────────────
 
-async function handleChatCompletions(request) {
+async function handleChatCompletions(request, ctx) {
   let openaiReq;
   try {
     openaiReq = await readJson(request);
@@ -1432,7 +1664,10 @@ async function handleChatCompletions(request) {
     return jsonResponse(401, { error: { message: 'Missing API key. Send in Authorization: Bearer <key> or x-api-key header', type: 'auth_error' } });
   }
 
-  await maybeRefreshCCVersion();
+  // 版本号刷新不阻塞首个字节：冷启动时把 npm registry 请求交给 waitUntil，
+  // 首请求仍用当前（或兜底）版本号，避免白白拉长响应时间。
+  if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(maybeRefreshCCVersion());
+  else await maybeRefreshCCVersion();
 
   const stream = openaiReq.stream === true;
   const requestedTokens = requestedNonStreamTokens(openaiReq);
@@ -1467,42 +1702,47 @@ async function handleChatCompletions(request) {
     if (stream) {
       const translator = createSseTranslator(model, completionId, created);
       const decoder = new TextDecoder();
+      const lineBuf = new LineBuffer();
       reader = ccResponse.body.getReader();
 
-      // Buffer until first visible chunk so we can still return JSON 429/502 like Node version
-      let lineBuf = '';
+      // 单个静默看门狗，贯穿预缓冲与后续转发（不再每次 read 建一个定时器）
+      const watcher = createIdleWatcher(CFG.streamIdleTimeoutMs, () => {
+        try { abortController.abort(); } catch {}
+        try { reader.cancel(); } catch {}
+      });
+
+      // 先缓冲到第一段可见内容，这样上游 401/429 之类仍能以 JSON 返回。
       let preEvents = [];
       let gotVisible = false;
       let streamError = null;
 
       try {
+        watcher.resume();
         while (!gotVisible) {
-          const result = await Promise.race([
-            reader.read(),
-            new Promise((_, reject) =>
-              setTimeout(() => reject(new Error('STREAM_IDLE_TIMEOUT')), STREAM_IDLE_TIMEOUT_MS)
-            ),
-          ]);
-          const { done, value } = result;
-          if (done) break;
-          bytesReceived += value.length;
-          lineBuf += decoder.decode(value, { stream: true });
-          const lines = lineBuf.split('\n');
-          lineBuf = lines.pop() || '';
-          for (const line of lines) {
-            const events = translator.parseLine(line);
-            if (events) {
-              preEvents.push(...events);
-              gotVisible = true;
+          const { done, value } = await readStream(reader, watcher);
+          if (watcher.timedOut) throw new Error('STREAM_IDLE_TIMEOUT');
+          if (done) {
+            for (const line of lineBuf.drain()) {
+              const sse = translator.pushLine(line);
+              if (sse) { preEvents.push(sse); gotVisible = true; }
             }
-            if (translator.lastCcEvent) lastCcEvent = translator.lastCcEvent;
+            break;
           }
+          bytesReceived += value.length;
+          const lines = lineBuf.push(decoder.decode(value, { stream: true }));
+          for (let i = 0; i < lines.length; i++) {
+            const sse = translator.pushLine(lines[i]);
+            if (sse) { preEvents.push(sse); gotVisible = true; }
+          }
+          const pending = translator.flushPending();
+          if (pending) { preEvents.push(pending); gotVisible = true; }
         }
       } catch (e) {
         streamError = e;
       }
 
       if (streamError) {
+        watcher.stop();
         try { reader.cancel(); } catch {}
         try { abortController.abort(); } catch {}
         if (streamError.message === 'STREAM_IDLE_TIMEOUT') {
@@ -1515,197 +1755,176 @@ async function handleChatCompletions(request) {
         return jsonResponse(502, { error: { message: `Upstream error: ${streamError.message}`, type: 'proxy_error', input_tokens: 0 }, retry_after: 10 });
       }
 
-      // Stream ended during pre-buffer with no visible output
-      if (!gotVisible) {
-        if (lineBuf.trim()) {
-          const events = translator.parseLine(lineBuf);
-          if (events) { preEvents.push(...events); gotVisible = true; }
-          lineBuf = '';
-        }
-        if (translator.outputTokens === 0 && preEvents.length === 0) {
-          try { abortController.abort(); } catch {}
-          return jsonResponse(429, { error: { message: 'Empty response from upstream (zero output tokens)', type: 'rate_limit_error' }, retry_after: 10 });
-        }
+      // 在预缓冲阶段就结束且没有任何可见输出
+      if (!gotVisible && translator.outputTokens === 0 && preEvents.length === 0) {
+        watcher.stop();
+        try { abortController.abort(); } catch {}
+        return jsonResponse(429, { error: { message: 'Empty response from upstream (zero output tokens)', type: 'rate_limit_error' }, retry_after: 10 });
       }
 
-      const body = new ReadableStream({
-        async start(controller) {
-          const enc = new TextEncoder();
-          const push = (s) => controller.enqueue(enc.encode(s));
-          try {
-            for (const evt of preEvents) push(evt);
-            let lastKeepaliveAt = Date.now();
+      const enc = new TextEncoder();
+      let queue = preEvents;
+      let finished = false;
+      let lastKeepaliveAt = Date.now();
 
-            // continue reading
-            while (true) {
-              if (abortController.signal.aborted) break;
-              const result = await Promise.race([
-                reader.read(),
-                new Promise((_, reject) =>
-                  setTimeout(() => reject(new Error('STREAM_IDLE_TIMEOUT')), STREAM_IDLE_TIMEOUT_MS)
-                ),
-              ]);
-              const { done, value } = result;
-              if (done) break;
-              bytesReceived += value.length;
-              lineBuf += decoder.decode(value, { stream: true });
-              const lines = lineBuf.split('\n');
-              lineBuf = lines.pop() || '';
-              let hadOutput = false;
-              for (const line of lines) {
-                const events = translator.parseLine(line);
-                if (events) {
-                  for (const evt of events) push(evt);
-                  hadOutput = true;
-                }
-                if (translator.lastCcEvent) lastCcEvent = translator.lastCcEvent;
+      // 用 pull 驱动而不是在 start() 里 free-run：拉取方（客户端）慢时形成真实背压，
+      // 不会把整段响应囤在 isolate 内存里。
+      const body = new ReadableStream({
+        async pull(controller) {
+          // 有待发送内容时先发出去
+          if (queue.length > 0) {
+            controller.enqueue(enc.encode(queue.join('')));
+            queue = [];
+            return;
+          }
+          if (finished) {
+            watcher.stop();
+            try { controller.close(); } catch {}
+            return;
+          }
+
+          watcher.resume();
+          try {
+            while (queue.length === 0) {
+              if (abortController.signal.aborted && !watcher.timedOut) {
+                // 客户端断开
+                finished = true;
+                watcher.stop();
+                try { reader.cancel(); } catch {}
+                try { controller.close(); } catch {}
+                return;
               }
-              // 仅在静默超过间隔时发 SSE comment，防止客户端超时；不再每个 silent chunk 都刷
-              if (!hadOutput && Date.now() - lastKeepaliveAt >= SSE_KEEPALIVE_INTERVAL_MS) {
-                push(': keepalive\n\n');
+
+              const { done, value } = await readStream(reader, watcher);
+
+              // 静默超时后 reader.cancel() 会让 read 以 done 结束，这里单独处理
+              if (watcher.timedOut) throw new Error('STREAM_IDLE_TIMEOUT');
+
+              if (done) {
+                for (const line of lineBuf.drain()) {
+                  const sse = translator.pushLine(line);
+                  if (sse) queue.push(sse);
+                }
+                const tail = translator.flushPending();
+                if (tail) queue.push(tail);
+                finished = true;
+                watcher.stop();
+
+                if (translator.outputTokens === 0) {
+                  // 输出为 0 记为错误，避免下游按空响应计费
+                  try { abortController.abort(); } catch {}
+                  logUsage({
+                    path: '/v1/chat/completions',
+                    model,
+                    stream: true,
+                    id: completionId,
+                    usage: {
+                      inputTokens: translator.inputTokens,
+                      outputTokens: translator.outputTokens,
+                      cachedInputTokens: translator.cachedInputTokens,
+                    },
+                    elapsedMs: Date.now() - startTime,
+                    bytesReceived,
+                    status: 'empty_output',
+                  });
+                  queue.push(`data: ${JSON.stringify({ error: { message: 'Empty response from upstream (zero output tokens)', type: 'rate_limit_error' }, retry_after: 10 })}\n\n`);
+                } else {
+                  consecutiveTimeouts = 0;
+                  logUsage({
+                    path: '/v1/chat/completions',
+                    model,
+                    stream: true,
+                    id: completionId,
+                    usage: {
+                      inputTokens: translator.inputTokens,
+                      outputTokens: translator.outputTokens,
+                      cachedInputTokens: translator.cachedInputTokens,
+                    },
+                    elapsedMs: Date.now() - startTime,
+                    bytesReceived,
+                    status: 'ok',
+                  });
+                  queue.push(translator.getDoneEvent());
+                }
+                break;
+              }
+
+              bytesReceived += value.length;
+              const lines = lineBuf.push(decoder.decode(value, { stream: true }));
+              for (let i = 0; i < lines.length; i++) {
+                const sse = translator.pushLine(lines[i]);
+                if (sse) queue.push(sse);
+              }
+              const tail = translator.flushPending();
+              if (tail) queue.push(tail);
+
+              // 仅在静默超过间隔时发 SSE 注释，防止客户端超时
+              if (queue.length === 0 && Date.now() - lastKeepaliveAt >= SSE_KEEPALIVE_INTERVAL_MS) {
+                queue.push(': keepalive\n\n');
                 lastKeepaliveAt = Date.now();
               }
             }
 
-            if (lineBuf.trim()) {
-              const events = translator.parseLine(lineBuf);
-              if (events) for (const evt of events) push(evt);
-            }
-
-            if (translator.outputTokens === 0) {
-              try { abortController.abort(); } catch {}
-              logUsage({
-                path: '/v1/chat/completions',
-                model,
-                stream: true,
-                id: completionId,
-                usage: {
-                  inputTokens: translator.inputTokens,
-                  outputTokens: translator.outputTokens,
-                  cachedInputTokens: translator.cachedInputTokens,
-                },
-                elapsedMs: Date.now() - startTime,
-                bytesReceived,
-                status: 'empty_output',
-              });
-              push(`data: ${JSON.stringify({ error: { message: 'Empty response from upstream (zero output tokens)', type: 'rate_limit_error' }, retry_after: 10 })}\n\n`);
-            } else {
-              consecutiveTimeouts = 0;
-              logUsage({
-                path: '/v1/chat/completions',
-                model,
-                stream: true,
-                id: completionId,
-                usage: {
-                  inputTokens: translator.inputTokens,
-                  outputTokens: translator.outputTokens,
-                  cachedInputTokens: translator.cachedInputTokens,
-                },
-                elapsedMs: Date.now() - startTime,
-                bytesReceived,
-                status: 'ok',
-              });
-              push(translator.getDoneEvent());
+            if (queue.length > 0) {
+              controller.enqueue(enc.encode(queue.join('')));
+              queue = [];
+            } else if (finished) {
+              try { controller.close(); } catch {}
             }
           } catch (e) {
-            if (abortController.signal.aborted) {
-              // client gone
-            } else if (e.message === 'STREAM_IDLE_TIMEOUT') {
+            finished = true;
+            watcher.stop();
+            try { reader.cancel(); } catch {}
+            if (e && e.message === 'STREAM_IDLE_TIMEOUT') {
               log('warn', 'Stream idle timeout', {
                 path: '/v1/chat/completions', model, streaming: true,
-                timeoutMs: STREAM_IDLE_TIMEOUT_MS, elapsedMs: Date.now() - startTime,
-                id: completionId, bytesReceived, lastCcEvent: lastCcEvent || '(none)',
+                timeoutMs: CFG.streamIdleTimeoutMs, elapsedMs: Date.now() - startTime,
+                id: completionId, bytesReceived, lastCcEvent: translator.lastCcEvent || '(none)',
               });
               try { abortController.abort(); } catch {}
               consecutiveTimeouts++;
               const timeoutMsg = consecutiveTimeouts >= TIMEOUT_REDUCE_CONTEXT_THRESHOLD
                 ? 'Response timeout - try reducing context length (summarize earlier messages)'
                 : 'Response timeout - request timed out';
-              push(`data: ${JSON.stringify({ error: { message: timeoutMsg, type: 'rate_limit_error' }, retry_after: 5 })}\n\n`);
+              queue.push(`data: ${JSON.stringify({ error: { message: timeoutMsg, type: 'rate_limit_error' }, retry_after: 5 })}\n\n`);
+            } else if (abortController.signal.aborted) {
+              // 客户端已断开，无需再写入错误
+              try { controller.close(); } catch {}
+              return;
             } else {
-              log('error', 'Stream error', { message: e.message });
+              log('error', 'Stream error', { message: e && e.message });
               try { abortController.abort(); } catch {}
-              push(`data: ${JSON.stringify({ error: { message: e.message, type: 'proxy_error' } })}\n\n`);
+              queue.push(`data: ${JSON.stringify({ error: { message: (e && e.message) || 'upstream error', type: 'proxy_error' } })}\n\n`);
+            }
+            if (queue.length > 0) {
+              controller.enqueue(enc.encode(queue.join('')));
+              queue = [];
             }
           } finally {
-            try { reader.cancel(); } catch {}
-            try { controller.close(); } catch {}
+            // 交出数据后进入等客户端状态，不再计为上游空闲
+            watcher.pause();
           }
         },
         cancel() {
+          finished = true;
+          watcher.stop();
           try { abortController.abort(); } catch {}
           try { reader?.cancel(); } catch {}
         },
       });
 
+      // 从返回响应到客户端第一次 pull 之间也在"等客户端"，先暂停空闲计时
+      watcher.pause();
       return new Response(body, { status: 200, headers: sseHeaders() });
     }
 
     // ── non-stream ──
-    let reasoningContent = '';
-    let finishReason = 'stop';
-    let usage = null;
-    let toolCalls = null;
-    reader = ccResponse.body.getReader();
-    const decoder = new TextDecoder();
-    let buf = '';
-
-    const processLines = () => {
-      const lines = buf.split('\n');
-      buf = lines.pop() || '';
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed || trimmed === '[DONE]' || trimmed.startsWith(':')) continue;
-        try {
-          const event = JSON.parse(trimmed);
-          switch (event.type) {
-            case 'text-delta': lastCcEvent = event.type; fullText += event.text || ''; break;
-            case 'reasoning-delta': lastCcEvent = event.type; reasoningContent += event.text || ''; break;
-            case 'tool-call':
-              lastCcEvent = event.type;
-              toolCalls = toolCalls || [];
-              toolCalls.push({
-                id: event.toolCallId || ('call_' + randomUUID().slice(0, 8)),
-                type: 'function',
-                function: {
-                  name: event.toolName || '',
-                  arguments: typeof event.input === 'string' ? event.input : JSON.stringify(event.input || {}),
-                },
-              });
-              break;
-            case 'finish':
-              lastCcEvent = event.type;
-              finishReason = mapFinishReason(event.finishReason || 'stop');
-              if (event.totalUsage) usage = event.totalUsage;
-              break;
-            case 'error':
-              lastCcEvent = event.type;
-              log('warn', 'CC stream error (non-stream)', { message: event.error?.message || event.message });
-              break;
-            case 'reasoning-end': case 'provider-metadata': case 'tool-input-start': case 'tool-input-delta': case 'tool-input-end': case 'tool-error': case 'text-end':
-              break;
-            default:
-              log('warn', 'Unknown CC event type', { type: event.type });
-              break;
-          }
-        } catch {}
-      }
-    };
-
-    while (true) {
-      const result = await Promise.race([
-        reader.read(),
-        new Promise((_, reject) =>
-          setTimeout(() => reject(new Error('STREAM_IDLE_TIMEOUT')), NONSTREAM_IDLE_TIMEOUT_MS)
-        ),
-      ]);
-      const { done, value } = result;
-      if (done) break;
-      bytesReceived += value.length;
-      buf += decoder.decode(value, { stream: true });
-      processLines();
-    }
-    processLines();
+    const collected = await collectCcStream(ccResponse, CFG.nonstreamIdleTimeoutMs);
+    bytesReceived = collected.bytes;
+    lastCcEvent = collected.lastEvent;
+    fullText = collected.text;
+    let usage = collected.usage;
+    const finishReason = collected.finishReason;
 
     if ((usage?.outputTokens ?? 0) === 0) {
       try { if (!abortController.signal.aborted) abortController.abort(); } catch {}
@@ -1735,8 +1954,8 @@ async function handleChatCompletions(request) {
         index: 0,
         message: Object.assign(
           { role: 'assistant', content: fullText || null },
-          toolCalls ? { tool_calls: toolCalls } : {},
-          reasoningContent ? { reasoning_content: reasoningContent } : {},
+          collected.toolCalls ? { tool_calls: collected.toolCalls } : {},
+          collected.reasoning ? { reasoning_content: collected.reasoning } : {},
         ),
         finish_reason: finishReason,
       }],
@@ -1747,6 +1966,7 @@ async function handleChatCompletions(request) {
         prompt_tokens_details: { cached_tokens: usage.cachedInputTokens ?? 0 },
       },
     });
+
   } catch (e) {
     if (abortController.signal.aborted) {
       log('warn', 'Request cancelled', { path: '/v1/chat/completions', model, completionId });
@@ -1755,7 +1975,7 @@ async function handleChatCompletions(request) {
     if (e.message === 'STREAM_IDLE_TIMEOUT') {
       log('warn', 'Stream idle timeout', {
         path: '/v1/chat/completions', model, streaming: false,
-        timeoutMs: NONSTREAM_IDLE_TIMEOUT_MS, elapsedMs: Date.now() - startTime,
+        timeoutMs: CFG.nonstreamIdleTimeoutMs, elapsedMs: Date.now() - startTime,
         id: completionId, bytesReceived, lastCcEvent: lastCcEvent || '(none)',
       });
       try { reader?.cancel(); } catch {}
@@ -1774,7 +1994,7 @@ async function handleChatCompletions(request) {
 
 // ── Anthropic Messages ───────────────────────────────
 
-async function handleMessages(request) {
+async function handleMessages(request, ctx) {
   let anthropicReq;
   try {
     anthropicReq = await readJson(request);
@@ -1788,7 +2008,10 @@ async function handleMessages(request) {
     return jsonResponse(401, { type: 'error', error: { type: 'authentication_error', message: 'Missing API key. Send in Authorization: Bearer <key> or x-api-key header' } });
   }
 
-  await maybeRefreshCCVersion();
+  // 版本号刷新不阻塞首个字节：冷启动时把 npm registry 请求交给 waitUntil，
+  // 首请求仍用当前（或兜底）版本号，避免白白拉长响应时间。
+  if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(maybeRefreshCCVersion());
+  else await maybeRefreshCCVersion();
 
   const stream = anthropicReq.stream === true;
   const requestedTokens = requestedNonStreamTokens(anthropicReq);
@@ -1824,22 +2047,17 @@ async function handleMessages(request) {
       messageId = 'msg_' + randomUUID().slice(0, 12);
       const ctx = { bytesReceived: 0, lastCcEvent: '', inputTokens: 0, outputTokens: 0, cachedInputTokens: 0 };
 
-      // Pre-buffer until first visible content
+      // 预缓冲到第一段可见内容，保留"上游失败时返回 JSON 错误"的行为
       const generator = createAnthropicSseTranslator(ccResponse, model, messageId, ctx);
       const pre = [];
       let gotVisible = false;
       let genError = null;
       let genDone = false;
-      let gen = generator[Symbol.asyncIterator]();
+      const gen = generator[Symbol.asyncIterator]();
 
       try {
         while (!gotVisible) {
-          const step = await Promise.race([
-            gen.next(),
-            new Promise((_, reject) =>
-              setTimeout(() => reject(new Error('STREAM_IDLE_TIMEOUT')), STREAM_IDLE_TIMEOUT_MS)
-            ),
-          ]);
+          const step = await gen.next();
           if (step.done) { genDone = true; break; }
           const event = step.value;
           pre.push(event);
@@ -1862,7 +2080,7 @@ async function handleMessages(request) {
       }
 
       if (!gotVisible && ctx.outputTokens === 0) {
-        // finished without content
+        // 没有产出就结束了
         const hasErrorEvent = pre.some(e => e.includes('"type":"error"') || e.includes('"type": "error"'));
         if (!hasErrorEvent) {
           try { abortController.abort(); } catch {}
@@ -1870,59 +2088,88 @@ async function handleMessages(request) {
         }
       }
 
+      const enc = new TextEncoder();
+      let finished = genDone;
+      let logged = false;
+
+      const finishOnce = () => {
+        if (logged) return;
+        logged = true;
+        consecutiveTimeouts = 0;
+        logUsage({
+          path: '/v1/messages',
+          model,
+          stream: true,
+          id: messageId,
+          usage: {
+            inputTokens: ctx.inputTokens,
+            outputTokens: ctx.outputTokens,
+            cachedInputTokens: ctx.cachedInputTokens,
+          },
+          elapsedMs: Date.now() - startTime,
+          bytesReceived: ctx.bytesReceived,
+          status: (ctx.outputTokens ?? 0) === 0 ? 'empty_output' : 'ok',
+        });
+      };
+
       const body = new ReadableStream({
-        async start(controller) {
-          const enc = new TextEncoder();
-          const push = (s) => controller.enqueue(enc.encode(s));
+        async pull(controller) {
+          if (pre.length > 0) {
+            controller.enqueue(enc.encode(pre.join('')));
+            pre.length = 0;
+            if (finished) { finishOnce(); try { controller.close(); } catch {} }
+            return;
+          }
+          if (finished) {
+            try { controller.close(); } catch {}
+            return;
+          }
           try {
-            for (const ev of pre) push(ev);
-            if (!genDone) {
-              while (true) {
-                if (abortController.signal.aborted) break;
-                const step = await gen.next();
-                if (step.done) break;
-                push(step.value);
-              }
-            }
-            consecutiveTimeouts = 0;
-            logUsage({
-              path: '/v1/messages',
-              model,
-              stream: true,
-              id: messageId,
-              usage: {
-                inputTokens: ctx.inputTokens,
-                outputTokens: ctx.outputTokens,
-                cachedInputTokens: ctx.cachedInputTokens,
-              },
-              elapsedMs: Date.now() - startTime,
-              bytesReceived: ctx.bytesReceived,
-              status: (ctx.outputTokens ?? 0) === 0 ? 'empty_output' : 'ok',
-            });
-          } catch (e) {
             if (abortController.signal.aborted) {
-              // ignore
-            } else if (e.message === 'STREAM_IDLE_TIMEOUT') {
+              finished = true;
+              try { controller.close(); } catch {}
+              return;
+            }
+            const step = await gen.next();
+            if (step.done) {
+              finished = true;
+              finishOnce();
+              try { controller.close(); } catch {}
+              return;
+            }
+            controller.enqueue(enc.encode(step.value));
+          } catch (e) {
+            finished = true;
+            try { const p = gen.return(undefined); if (p && p.catch) p.catch(() => {}); } catch {}
+            if (abortController.signal.aborted) {
+              try { controller.close(); } catch {}
+              return;
+            }
+            let msg;
+            if (e && e.message === 'STREAM_IDLE_TIMEOUT') {
               log('warn', 'Stream idle timeout', {
                 path: '/v1/messages', model, streaming: true,
-                timeoutMs: STREAM_IDLE_TIMEOUT_MS, elapsedMs: Date.now() - startTime, id: messageId,
+                timeoutMs: CFG.streamIdleTimeoutMs, elapsedMs: Date.now() - startTime, id: messageId,
               });
               try { abortController.abort(); } catch {}
               consecutiveTimeouts++;
               const timeoutMsg = consecutiveTimeouts >= TIMEOUT_REDUCE_CONTEXT_THRESHOLD
                 ? 'Response timeout - try reducing context length (summarize earlier messages)'
                 : 'Response timeout - request timed out';
-              push(`event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: timeoutMsg }, retry_after: 5 })}\n\n`);
+              msg = `event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: timeoutMsg }, retry_after: 5 })}\n\n`;
             } else {
-              log('error', 'Anthropic stream error', { message: e.message });
+              log('error', 'Anthropic stream error', { message: e && e.message });
               try { abortController.abort(); } catch {}
-              push(`event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'internal_error', message: e.message } })}\n\n`);
+              msg = `event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'internal_error', message: (e && e.message) || 'upstream error' } })}\n\n`;
             }
-          } finally {
+            controller.enqueue(enc.encode(msg));
             try { controller.close(); } catch {}
           }
         },
         cancel() {
+          finished = true;
+          // 关闭生成器，让它内部的 finally 清理看门狗并取消上游读取
+          try { const p = gen.return(undefined); if (p && p.catch) p.catch(() => {}); } catch {}
           try { abortController.abort(); } catch {}
         },
       });
@@ -1932,69 +2179,12 @@ async function handleMessages(request) {
 
     // non-stream Anthropic
     messageId = 'msg_' + randomUUID().slice(0, 12);
-    let finishReason = 'stop';
-    let usage = null;
-    let toolCalls = null;
-    let thinkingText = ''; // CC reasoning → Anthropic thinking block
-    reader = ccResponse.body.getReader();
-    const decoder = new TextDecoder();
-    let buf = '';
-
-    const processLines = () => {
-      const lines = buf.split('\n');
-      buf = lines.pop() || '';
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed || trimmed === '[DONE]') continue;
-        try {
-          const event = JSON.parse(trimmed);
-          switch (event.type) {
-            case 'text-delta': lastCcEvent = event.type; fullText += event.text || ''; break;
-            case 'reasoning-delta': lastCcEvent = event.type; thinkingText += event.text || ''; break;
-            case 'tool-call':
-              lastCcEvent = event.type;
-              (toolCalls = toolCalls || []).push({
-                id: event.toolCallId || ('call_' + randomUUID().slice(0, 8)),
-                type: 'function',
-                function: {
-                  name: event.toolName || '',
-                  arguments: typeof event.input === 'string' ? event.input : JSON.stringify(event.input || {}),
-                },
-              });
-              break;
-            case 'finish':
-              lastCcEvent = event.type;
-              finishReason = mapFinishReason(event.finishReason || 'stop');
-              if (event.totalUsage) usage = event.totalUsage;
-              break;
-            case 'error':
-              lastCcEvent = event.type;
-              log('warn', 'CC error (Anthropic non-stream)', { message: event.error?.message || event.message });
-              break;
-            case 'reasoning-end': case 'provider-metadata': case 'tool-input-start': case 'tool-input-delta': case 'tool-input-end': case 'tool-error': case 'text-end':
-              break;
-            default:
-              log('warn', 'Unknown CC event type', { type: event.type });
-              break;
-          }
-        } catch {}
-      }
-    };
-
-    while (true) {
-      const result = await Promise.race([
-        reader.read(),
-        new Promise((_, reject) =>
-          setTimeout(() => reject(new Error('STREAM_IDLE_TIMEOUT')), NONSTREAM_IDLE_TIMEOUT_MS)
-        ),
-      ]);
-      const { done, value } = result;
-      if (done) break;
-      bytesReceived += value.length;
-      buf += decoder.decode(value, { stream: true });
-      processLines();
-    }
-    processLines();
+    const collected = await collectCcStream(ccResponse, CFG.nonstreamIdleTimeoutMs);
+    bytesReceived = collected.bytes;
+    lastCcEvent = collected.lastEvent;
+    fullText = collected.text;
+    let usage = collected.usage;
+    const finishReason = collected.finishReason;
 
     if ((usage?.outputTokens ?? 0) === 0) {
       try { if (!abortController.signal.aborted) abortController.abort(); } catch {}
@@ -2015,7 +2205,8 @@ async function handleMessages(request) {
       finishReason,
       status: 'ok',
     });
-    return jsonResponse(200, buildAnthropicResponse(model, fullText, toolCalls, finishReason, usage, thinkingText));
+    return jsonResponse(200, buildAnthropicResponse(model, fullText, collected.toolCalls, finishReason, usage, collected.reasoning));
+
   } catch (e) {
     if (abortController.signal.aborted) {
       log('warn', 'Request cancelled', { path: '/v1/messages', model, messageId });
@@ -2024,7 +2215,7 @@ async function handleMessages(request) {
     if (e.message === 'STREAM_IDLE_TIMEOUT') {
       log('warn', 'Stream idle timeout', {
         path: '/v1/messages', model, streaming: false,
-        timeoutMs: NONSTREAM_IDLE_TIMEOUT_MS, elapsedMs: Date.now() - startTime, id: messageId,
+        timeoutMs: CFG.nonstreamIdleTimeoutMs, elapsedMs: Date.now() - startTime, id: messageId,
       });
       try { reader?.cancel(); } catch {}
       try { abortController.abort(); } catch {}
@@ -2083,10 +2274,13 @@ async function fetchModels(apiKey) {
   return MODELS;
 }
 
-async function handleModels(request) {
+async function handleModels(request, ctx) {
   const headers = headerObj(request);
   const apiKey = getApiKey(headers) || CFG.apiKey || null;
-  await maybeRefreshCCVersion();
+  // 版本号刷新不阻塞首个字节：冷启动时把 npm registry 请求交给 waitUntil，
+  // 首请求仍用当前（或兜底）版本号，避免白白拉长响应时间。
+  if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(maybeRefreshCCVersion());
+  else await maybeRefreshCCVersion();
   const models = await fetchModels(apiKey);
   const now = nowUnix();
   return jsonResponse(200, {
@@ -2103,7 +2297,7 @@ async function handleModels(request) {
 // ── Worker entry ─────────────────────────────────────
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     CFG = loadConfig(env || {});
 
     if (request.method === 'OPTIONS') {
@@ -2114,11 +2308,11 @@ export default {
     let res;
     try {
       if (url.pathname === '/v1/chat/completions' && request.method === 'POST') {
-        res = await handleChatCompletions(request);
+        res = await handleChatCompletions(request, ctx);
       } else if (url.pathname === '/v1/messages' && request.method === 'POST') {
-        res = await handleMessages(request);
+        res = await handleMessages(request, ctx);
       } else if (url.pathname === '/v1/models' && request.method === 'GET') {
-        res = await handleModels(request);
+        res = await handleModels(request, ctx);
       } else if (url.pathname === '/health' || url.pathname === '/') {
         res = new Response('OK', { status: 200, headers: { 'Content-Type': 'text/plain' } });
       } else {
