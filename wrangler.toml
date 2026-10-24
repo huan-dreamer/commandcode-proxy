@@ -9,11 +9,12 @@ CC_API_BASE = "https://api.commandcode.ai"
 PROJECT_SLUG = "cc-proxy"
 CC_USE_PROVIDER_MODELS = "true"
 
-# 工具 schema 自动裁剪（默认 auto：超预算才裁）。上游报 JSON Schema expansion too large 时
-# 通常无需干预；想更激进可调小预算。
+# 默认忠实转发：工具 schema 原样透传给上游，代理不改写请求体。
+# 仅当无法减少工具数量、且上游报 "JSON Schema reference expansion is too large" 时，
+# 才显式开启裁剪（有损：参数约束会变宽松）。
+# CC_SCHEMA_SLIM = "auto"    # 超出预算才裁
+# CC_SCHEMA_SLIM = "always"  # 无条件裁
 # CC_TOOL_SCHEMA_BUDGET = "65536"
-# CC_SCHEMA_SLIM = "off"     # 关闭裁剪
-# CC_SCHEMA_SLIM = "always"  # 无条件裁剪
 
 # 空闲超时（毫秒）。上游慢/抖动大时可放宽；想更快失败并让客户端重试时可收紧。
 # 说明见 README「性能与 CPU 限制」。

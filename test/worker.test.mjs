@@ -894,7 +894,8 @@ test('CC_SCHEMA_SLIM=always shrinks oversized tool schemas before forwarding', a
   assert.deepEqual(tools[1].input_schema, { type: 'object', properties: { a: { type: 'string' } } });
 });
 
-test('CC_SCHEMA_SLIM=off forwards the schema verbatim', async () => {
+test('by default the proxy does not rewrite tool schemas', async () => {
+  // 代理默认是忠实转发：即使 schema 很大也逐字节原样送出
   const huge = massiveSchema(3);
   const captured = captureBody(okStream);
   try {
@@ -902,14 +903,14 @@ test('CC_SCHEMA_SLIM=off forwards the schema verbatim', async () => {
       model: 'm', stream: true,
       messages: [{ role: 'user', content: 'x' }],
       tools: [{ type: 'function', function: { name: 't', parameters: huge } }],
-    }, { env: { CC_SCHEMA_SLIM: 'off' } });
+    });
   } finally {
     globalThis.fetch = originalFetch;
   }
   assert.deepEqual(captured.body.params.tools[0].input_schema, huge);
 });
 
-test('auto mode (default) leaves a normal-sized tool set untouched', async () => {
+test('CC_SCHEMA_SLIM=auto leaves a normal-sized tool set untouched', async () => {
   const captured = captureBody(okStream);
   const tools = Array.from({ length: 5 }, (_, i) => ({
     type: 'function',
@@ -937,7 +938,7 @@ test('auto mode slims oversized schemas without being asked', async () => {
       model: 'm', stream: true,
       messages: [{ role: 'user', content: 'x' }],
       tools: [{ type: 'function', function: { name: 'huge', description: 'd', parameters: huge } }],
-    }, { env: { CC_TOOL_SCHEMA_BUDGET: '8192' } });
+    }, { env: { CC_SCHEMA_SLIM: 'auto', CC_TOOL_SCHEMA_BUDGET: '8192' } });
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -960,7 +961,7 @@ test('budget enforcement blanks the largest schemas but keeps names/descriptions
   try {
     await call('/v1/chat/completions', {
       model: 'm', stream: true, messages: [{ role: 'user', content: 'x' }], tools,
-    }, { env: { CC_TOOL_SCHEMA_BUDGET: '2048' } });
+    }, { env: { CC_SCHEMA_SLIM: 'auto', CC_TOOL_SCHEMA_BUDGET: '2048' } });
   } finally {
     globalThis.fetch = originalFetch;
   }

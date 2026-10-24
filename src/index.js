@@ -24,9 +24,10 @@ function loadConfig(env = {}) {
     apiKey: env.CC_API_KEY || '',
     logLevel: env.LOG_LEVEL || 'info',
     useProviderModels: env.CC_USE_PROVIDER_MODELS !== 'false',
-    // auto（默认）| always | off
-    // auto：工具 schema 总量超过预算时才裁；always：无条件裁；off：原样转发
-    schemaSlimming: ['always', 'off'].includes(env.CC_SCHEMA_SLIM) ? env.CC_SCHEMA_SLIM : 'auto',
+    // off（默认，忠实转发）| auto | always
+    // 代理默认不改写请求体：工具 schema 原样透传，上游拒绝就把原因如实返回。
+    // 只有显式设置 CC_SCHEMA_SLIM 才启用裁剪（那是明知有损的逃生门）。
+    schemaSlimming: ['auto', 'always'].includes(env.CC_SCHEMA_SLIM) ? env.CC_SCHEMA_SLIM : 'off',
     // 工具 schema 的总字节预算。超过就裁剪，必要时把最大的几个工具的
     // 参数约束清空（保留名字和描述）。
     toolSchemaBudget: parseInt(env.CC_TOOL_SCHEMA_BUDGET || String(64 * 1024), 10),
